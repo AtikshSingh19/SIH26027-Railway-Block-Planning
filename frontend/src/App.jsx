@@ -20,8 +20,11 @@ function ProtectedLayout() {
   const { isAuthenticated, role } = useRole()
   const location = useLocation()
   if (!isAuthenticated) return <Navigate to="/login" replace state={{ from: location }} />
-  const allowed = role.category === 'employee' ? ['/', '/maintenance-records'] : role.category === 'admin' ? ['/', '/data-processing', '/analytics', '/reports', '/settings'] : ['/', '/maintenance-records', '/block-requests', '/block-planner', '/plans', '/train-timeline', '/simulator', '/alerts']
-  if (!allowed.includes(location.pathname)) return <Navigate to="/" replace />
+  const isEmployee = role?.category === 'employee'
+  const employeeAllowed = ['/', '/maintenance-records']
+  if (isEmployee && !employeeAllowed.includes(location.pathname)) {
+    return <Navigate to="/" replace />
+  }
   return <MainLayout />
 }
 

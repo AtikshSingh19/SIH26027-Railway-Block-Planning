@@ -62,15 +62,11 @@ export default function Sidebar() {
   const { role } = useRole()
   const criticalAlertCount = alerts?.filter((a) => a.severity === 'Critical').length
 
-  const employee = role.category === 'employee'
-  const admin = role.category === 'admin'
-  const planner = role.category === 'planner'
+  const isEmployee = role?.category === 'employee'
   const visibleGroups = NAV_GROUPS.map((group) => ({
     ...group,
     items: group.items.filter((item) => {
-      if (employee) return ['/', '/maintenance-records'].includes(item.to)
-      if (admin) return ['/', '/analytics', '/reports', '/settings', '/data-processing'].includes(item.to)
-      if (planner) return ['/', '/maintenance-records', '/block-requests', '/block-planner', '/plans', '/train-timeline', '/simulator', '/alerts'].includes(item.to)
+      if (isEmployee) return ['/', '/maintenance-records'].includes(item.to)
       return true
     }),
   })).filter((group) => group.items.length)
