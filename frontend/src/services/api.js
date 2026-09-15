@@ -196,6 +196,16 @@ async function getTrains() {
   return data
 }
 
+async function getSections() {
+  const { data } = await httpClient.get('/sections')
+  return data
+}
+
+async function getStations() {
+  const { data } = await httpClient.get('/stations')
+  return data
+}
+
 // ---------------------------------------------------------------------------
 // Block Requests & Maintenance Requests
 // ---------------------------------------------------------------------------
@@ -381,6 +391,8 @@ const api = {
   getCorridors,
   getBlockRequests,
   getTrains,
+  getSections,
+  getStations,
   getPlans,
   getPlan,
   getPlanDashboard,
