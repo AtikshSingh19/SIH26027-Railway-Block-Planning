@@ -1,6 +1,8 @@
 import datetime
 from contextlib import asynccontextmanager
 from typing import Dict, List, Optional
+from ml_inference import apply_ml_predictions
+from replanner import generate_fallback_plans_from_ml
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -11,7 +13,7 @@ from database.connection import (
     initialize_database,
     save_optimization_result,
 )
-from logic import solve_block_schedule
+from logic import solve_block_schedule, OptimizationResult
 from models import (
     Disruption,
     MaintenanceRequest,
@@ -805,15 +807,52 @@ def optimize(request: OptimizationRequest):
                 detail={"message": "Only APPROVED maintenance requests can be optimized.", "requests": non_approved},
             )
 
-        result = solve_block_schedule(
+        ml_requests = apply_ml_predictions(
             requests=request.maintenance_requests,
+            sections=request.sections,
+        )
+
+        result = solve_block_schedule(
+            requests=ml_requests,
             trains=request.trains,
             sections=request.sections,
             disruptions=request.disruptions,
             objective_type=request.objective_type,
         )
 
+        for ml_request in ml_requests:
+            connection.execute(
+                """
+                UPDATE maintenance_requests
+                SET predicted_duration_min = ?,
+                    prediction_confidence = ?
+                WHERE id = ?
+                """,
+                (
+                    ml_request.predicted_duration_min,
+                    ml_request.prediction_confidence,
+                    ml_request.id,
+                ),
+            )
+
+        connection.commit()
+
         save_optimization_result(connection, result)
+
+        final_plan_id = result.plan.plan_id
+
+        for block in result.blocks:
+                block_number = block.block_id.split("_B")[-1]
+                block.plan_id = final_plan_id
+                block.block_id = f"{final_plan_id}_B{block_number}"
+
+        for task in result.scheduled_tasks:
+                task_block_number = task.block_id.split("_B")[-1]
+                task.block_id = f"{final_plan_id}_B{task_block_number}"
+
+        for explanation in result.explanations:
+                explanation.plan_id = final_plan_id
+
         return result
 
     except HTTPException:
@@ -861,16 +900,40 @@ def optimize_from_database(payload: DatabaseOptimizationRequest = DatabaseOptimi
         sections = [Section(**dict(row)) for row in section_rows]
         disruptions = [Disruption(**dict(row)) for row in disruption_rows]
 
-        result = solve_block_schedule(
+        ml_requests = apply_ml_predictions(
             requests=maintenance_requests,
+            sections=sections,
+        )
+
+        for ml_request in ml_requests:
+            connection.execute(
+                """
+                UPDATE maintenance_requests
+                SET predicted_duration_min = ?,
+                    prediction_confidence = ?
+                WHERE id = ?
+                """,
+                (
+                    ml_request.predicted_duration_min,
+                    ml_request.prediction_confidence,
+                    ml_request.id,
+                ),
+            )
+
+        connection.commit()
+
+        plans = generate_fallback_plans_from_ml(
+            ml_requests=ml_requests,
             trains=trains,
             sections=sections,
             disruptions=disruptions,
-            objective_type=payload.objective_type or "BALANCED",
+            emergency_inserts=[],
+            parallel=False,
+            sort_by_rank=False,
         )
 
-        save_optimization_result(connection, result)
-        return result
+        return plans
+
     finally:
         connection.close()
 
@@ -1030,6 +1093,65 @@ def approve_plan(plan_id: str):
     finally:
         connection.close()
 
+@app.post("/plans/approve")
+def approve_selected_plan(result: OptimizationResult):
+    connection = get_connection()
+
+    try:
+        # Save ONLY the selected candidate
+        save_optimization_result(
+            connection,
+            result,
+        )
+
+        # save_optimization_result() assigns the real database ID
+        plan_id = result.plan.plan_id
+
+        # Approve the saved plan
+        connection.execute(
+            """
+            UPDATE block_plans
+            SET status = 'APPROVED'
+            WHERE plan_id = ?
+            """,
+            (plan_id,),
+        )
+
+        # Mark only requests belonging to this selected plan as planned
+        connection.execute(
+            """
+            UPDATE maintenance_requests
+            SET planning_status = 'PLANNED',
+                plan_id = ?
+            WHERE id IN (
+                SELECT st.request_id
+                FROM scheduled_tasks st
+                JOIN maintenance_blocks mb
+                    ON st.block_id = mb.block_id
+                WHERE mb.plan_id = ?
+            )
+            """,
+            (plan_id, plan_id),
+        )
+
+        connection.commit()
+
+        updated_plan = connection.execute(
+            """
+            SELECT *
+            FROM block_plans
+            WHERE plan_id = ?
+            """,
+            (plan_id,),
+        ).fetchone()
+
+        return {
+            "message": "Selected plan approved successfully.",
+            "plan": dict(updated_plan),
+        }
+
+    finally:
+        connection.close()
 
 @app.post("/plans/{plan_id}/reject")
 def reject_plan(plan_id: str, payload: RejectPlanRequest = RejectPlanRequest()):

@@ -62,22 +62,21 @@ def initialize_database():
 
 
 
-def save_optimization_result(connection, result):
+def save_optimization_result(connection, result, plan_id=None):
 
     plan = result.plan
 
-    # Generate unique plan ID
-    existing_count = connection.execute(
-        "SELECT COUNT(*) FROM block_plans"
-    ).fetchone()[0]
+    if plan_id is None:
+        existing_count = connection.execute(
+            "SELECT COUNT(*) FROM block_plans"
+        ).fetchone()[0]
 
-    new_plan_id = f"PLAN_{existing_count + 1:03d}"
+        new_plan_id = f"PLAN_{existing_count + 1:03d}"
+    else:
+        new_plan_id = plan_id
 
-    # IMPORTANT:
-    # Make response plan ID match database plan ID
     plan.plan_id = new_plan_id
 
-    # Save plan as awaiting human review
     connection.execute(
         """
         INSERT INTO block_plans (
@@ -89,10 +88,11 @@ def save_optimization_result(connection, result):
             blocks_saved,
             total_wait_time_min,
             total_train_delay_min,
+            total_window_shift_min,
             created_at,
             status
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             new_plan_id,
@@ -105,12 +105,12 @@ def save_optimization_result(connection, result):
             plan.blocks_saved,
             plan.total_wait_time_min,
             plan.total_train_delay_min,
+            getattr(plan, "total_window_shift_min", 0),
             plan.created_at,
             "PENDING_REVIEW",
         )
     )
 
-    # Save blocks
     for block in result.blocks:
 
         block_number = block.block_id.split("_B")[-1]
@@ -136,7 +136,6 @@ def save_optimization_result(connection, result):
             )
         )
 
-    # Save scheduled tasks
     for task in result.scheduled_tasks:
 
         task_block_number = task.block_id.split("_B")[-1]
@@ -164,7 +163,6 @@ def save_optimization_result(connection, result):
             )
         )
 
-    # Save explanations
     for explanation in result.explanations:
 
         connection.execute(

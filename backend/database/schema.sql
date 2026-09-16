@@ -107,6 +107,12 @@ CREATE TABLE IF NOT EXISTS maintenance_requests (
             OR predicted_duration_min > 0
         ),
 
+    prediction_confidence REAL
+        CHECK(
+            prediction_confidence IS NULL
+            OR (prediction_confidence >= 0.0 AND prediction_confidence <= 1.0)
+    ),
+
     crew_size INTEGER NOT NULL DEFAULT 5
         CHECK(crew_size >= 1),
 
@@ -208,6 +214,9 @@ CREATE TABLE IF NOT EXISTS block_plans (
 
     total_train_delay_min INTEGER NOT NULL DEFAULT 0
         CHECK(total_train_delay_min >= 0),
+
+    total_window_shift_min REAL NOT NULL DEFAULT 0.0
+        CHECK(total_window_shift_min >= 0),
 
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 

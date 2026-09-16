@@ -324,11 +324,10 @@ async function reoptimizePlan(planId) {
   return data
 }
 
-async function approvePlan(planId) {
-  const { data } = await httpClient.post(`/plans/${planId}/approve`)
+async function approvePlan(result) {
+  const { data } = await httpClient.post('/plans/approve', result)
   return data
 }
-
 async function rejectPlan(planId, reason) {
   const { data } = await httpClient.post(`/plans/${planId}/reject`, { reason })
   return data
