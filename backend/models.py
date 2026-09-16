@@ -111,6 +111,12 @@ class MaintenanceRequest(BaseModel):
         gt=0,
     )
 
+    prediction_confidence: Optional[float] = Field(
+        default=None,
+        ge=0.0,
+        le=1.0
+    )
+
     crew_size: int = Field(..., ge=1)
 
     # 1 = High / critical
@@ -185,6 +191,7 @@ class BlockPlan(BaseModel):
     blocks_saved: int = Field(..., ge=0)
 
     total_wait_time_min: int = Field(..., ge=0)
+    total_window_shift_min: int = Field(default=0, ge=0)
     total_train_delay_min: int = Field(..., ge=0)
 
     created_at: datetime = Field(default_factory=datetime.now)

@@ -60,6 +60,7 @@ def solve_block_schedule(
     planning_horizon_min: int = 5760,
     block_weight: int = 50,
     window_violation_weight: int = 10,
+    train_delay_weight: int = 1,
     max_solver_time_seconds: int = 10,
 ) -> OptimizationResult:
 
@@ -343,7 +344,9 @@ def solve_block_schedule(
         for request in all_requests
     )
     total_weighted_train_delay = sum(
-        delay_var * (120 if train_by_id[train_id].priority == 1 else 15)
+        delay_var
+        * (120 if train_by_id[train_id].priority == 1 else 15)
+        * train_delay_weight
         for train_id, delay_var in optimizer_train_delay_vars.items()
     )
 
@@ -421,7 +424,13 @@ def solve_block_schedule(
 
     total_blocks_count = len(blocks)
     blocks_saved = len(all_requests) - total_blocks_count
-    total_wait_time = sum(abs(task.start_deviation_min) for task in scheduled_tasks)
+
+    total_window_shift = sum(
+        abs(task.start_deviation_min)
+        for task in scheduled_tasks
+    )
+
+    total_wait_time = total_window_shift
     total_train_delay = sum(
         decision.optimizer_added_delay_min for decision in delay_decisions
     )
@@ -465,6 +474,7 @@ def solve_block_schedule(
         total_blocks_count=total_blocks_count,
         blocks_saved=blocks_saved,
         total_wait_time_min=total_wait_time,
+        total_window_shift_min=total_window_shift,
         total_train_delay_min=total_train_delay,
     )
 
