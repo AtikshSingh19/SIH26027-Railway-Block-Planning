@@ -13,12 +13,12 @@ import api from '../services/api'
 import { CORRIDORS } from '../utils/constants'
 import { useRole } from '../context/RoleContext'
 import { KPI_REGISTRY, ROLE_DASHBOARD_CONFIG, kpiGridColsClass } from '../config/dashboardConfig'
-import { useWorkflow } from '../context/WorkflowContext'
+
 import { sampleSections } from '../data/sampleOptimizationPayload'
 
 export default function Dashboard() {
   const { role } = useRole()
-  const workflow = useWorkflow()
+
   const [adminUsers, setAdminUsers] = useState([
     { id: 'EMP-1001', name: 'Asha Verma', role: 'Employee', department: 'Engineering', active: true },
     { id: 'EMP-1002', name: 'Rohan Singh', role: 'Planner', department: 'S&T', active: true },

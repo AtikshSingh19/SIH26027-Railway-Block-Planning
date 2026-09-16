@@ -191,14 +191,14 @@ def migrate_database():
     connection = get_connection()
 
     try:
-        columns = {
+        maintenance_columns = {
             row["name"]
             for row in connection.execute(
                 "PRAGMA table_info(maintenance_requests)"
             ).fetchall()
         }
 
-        if "status" not in columns:
+        if "status" not in maintenance_columns:
             connection.execute(
                 """
                 ALTER TABLE maintenance_requests
@@ -207,11 +207,34 @@ def migrate_database():
                 """
             )
 
-        if "rejection_reason" not in columns:
+        if "rejection_reason" not in maintenance_columns:
             connection.execute(
                 """
                 ALTER TABLE maintenance_requests
                 ADD COLUMN rejection_reason TEXT
+                """
+            )
+
+        if "prediction_confidence" not in maintenance_columns:
+            connection.execute(
+                """
+                ALTER TABLE maintenance_requests
+                ADD COLUMN prediction_confidence REAL
+                """
+            )
+
+        block_plan_columns = {
+            row["name"]
+            for row in connection.execute(
+                "PRAGMA table_info(block_plans)"
+            ).fetchall()
+        }
+
+        if "total_window_shift_min" not in block_plan_columns:
+            connection.execute(
+                """
+                ALTER TABLE block_plans
+                ADD COLUMN total_window_shift_min REAL NOT NULL DEFAULT 0.0
                 """
             )
 

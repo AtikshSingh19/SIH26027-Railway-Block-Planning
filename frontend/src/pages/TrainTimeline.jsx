@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { ArrowRight, BarChart3, LayoutGrid } from 'lucide-react'
 import SectionHeader from '../components/common/SectionHeader'
@@ -15,8 +15,6 @@ import RouteGanttChart from '../components/timeline/RouteGanttChart'
 import { useFetch } from '../hooks/useFetch'
 import api from '../services/api'
 import { CORRIDORS } from '../utils/constants'
-import { useWorkflow } from '../context/WorkflowContext'
-import { sampleSections, sampleStations } from '../data/sampleOptimizationPayload'
 import { severityTone, blockRequestStatusTone } from '../utils/status'
 import { formatDateTime, addMinutesToIso, formatDurationMins } from '../utils/formatters'
 
@@ -29,11 +27,54 @@ export default function TrainTimeline() {
   )
   const { data: blockRequests, loading: requestsLoading } = useFetch(() => api.getBlockRequests(), [])
   const { data: plans } = useFetch(() => api.getPlans(), [])
-  const workflow = useWorkflow()
+  const { data: sections } = useFetch(() => api.getSections(), [])
+  const { data: stations } = useFetch(() => api.getStations(), [])
+
 
   const [viewMode, setViewMode] = useState('gantt') // 'gantt' | 'cards'
   const [corridor, setCorridor] = useState('')
   const [selectedItem, setSelectedItem] = useState(null)
+  const [planDetails, setPlanDetails] = useState({})
+  useEffect(() => {
+  let cancelled = false
+
+  async function loadPlanDetails() {
+    const planList = Array.isArray(plans) ? plans : plans ? [plans] : []
+
+    if (planList.length === 0) {
+      setPlanDetails({})
+      return
+    }
+
+    try {
+      const results = await Promise.allSettled(
+        planList.map(async (plan) => {
+          const detail = await api.getPlan(plan.plan_id)
+          return [plan.plan_id, detail]
+        }),
+      )
+const entries = results
+  .filter((result) => result.status === 'fulfilled')
+  .map((result) => result.value)
+
+      if (!cancelled) {
+        setPlanDetails(Object.fromEntries(entries))
+      }
+    } catch (error) {
+      console.error('Could not load plan details:', error)
+
+      if (!cancelled) {
+        setPlanDetails({})
+      }
+    }
+  }
+
+  loadPlanDetails()
+
+  return () => {
+    cancelled = true
+  }
+}, [plans])
 
   const corridorOptions = useMemo(() => {
     if (!trains || !blockRequests) {
@@ -77,31 +118,50 @@ export default function TrainTimeline() {
         })
       })
 
-    const names = Object.fromEntries(sampleStations.map((x) => [x.id, x.name]))
-    const corridorForSection = (sectionId) => {
-      const sec = sampleSections.find((x) => x.id === sectionId)
-      return sec ? `${names[sec.source_station_id]} → ${names[sec.target_station_id]}` : sectionId
-    }
+    const names = Object.fromEntries((stations || []).map((x) => [x.id, x.name]))
 
-    Object.values(workflow?.state?.planDetails || {}).forEach((detail) => {
-      detail.blocks?.forEach((b) => {
-        const base = new Date(`${detail.plan.created_at.slice(0, 10)}T00:00:00`)
-        base.setMinutes(Number(b.block_start_min))
-        const end = new Date(`${detail.plan.created_at.slice(0, 10)}T00:00:00`)
-        end.setMinutes(Number(b.block_end_min))
-        items.push({
-          id: `plan-block-${b.block_id}`,
-          corridor: corridorForSection(b.section_id),
-          label: `🛠️ ${b.block_id}`,
-          sub: `${detail.plan.plan_name} · ${b.section_id}`,
-          start: base.toISOString().slice(0, 19),
-          end: end.toISOString().slice(0, 19),
-          tone: 'ai',
-          kind: 'plan-block',
-          raw: b,
-        })
-      })
+const corridorForSection = (sectionId) => {
+  const sec = (sections || []).find((x) => x.id === sectionId)
+
+  return sec
+    ? `${names[sec.source_station_id]} → ${names[sec.target_station_id]}`
+    : sectionId
+}
+
+    const approvedPlans = Object.values(planDetails || {})
+  .filter((detail) => detail?.plan?.status === 'APPROVED')
+  .sort(
+    (a, b) =>
+      new Date(b.plan.created_at) - new Date(a.plan.created_at)
+  )
+
+const currentPlan = approvedPlans[0]
+
+if (currentPlan) {
+  currentPlan.blocks?.forEach((b) => {
+    const base = new Date(
+      `${currentPlan.plan.created_at.slice(0, 10)}T00:00:00`
+    )
+    base.setMinutes(Number(b.block_start_min))
+
+    const end = new Date(
+      `${currentPlan.plan.created_at.slice(0, 10)}T00:00:00`
+    )
+    end.setMinutes(Number(b.block_end_min))
+
+    items.push({
+      id: `plan-block-${b.block_id}`,
+      corridor: corridorForSection(b.section_id),
+      label: `🛠️ ${b.block_id}`,
+      sub: `${currentPlan.plan.plan_name} · ${b.section_id}`,
+      start: base.toISOString().slice(0, 19),
+      end: end.toISOString().slice(0, 19),
+      tone: 'ai',
+      kind: 'plan-block',
+      raw: b,
     })
+  })
+}
 
     const byCorridor = {}
     items.forEach((item) => {
@@ -112,7 +172,7 @@ export default function TrainTimeline() {
     return CORRIDORS.filter((c) => byCorridor[c] && byCorridor[c].length > 0)
       .filter((c) => !corridor || c === corridor)
       .map((c) => ({ corridor: c, items: byCorridor[c] }))
-  }, [trains, blockRequests, corridor, workflow?.state?.planDetails])
+  }, [trains, blockRequests, corridor, planDetails, sections, stations])
 
   const loading = trainsLoading || requestsLoading
 
@@ -165,7 +225,7 @@ export default function TrainTimeline() {
           trains={trains || []}
           blockRequests={blockRequests || []}
           plans={plans || []}
-          planDetails={workflow?.state?.planDetails || {}}
+          planDetails={planDetails}
           selectedCorridor={corridor}
           onSelectCorridor={setCorridor}
           corridorOptions={corridorOptions}
