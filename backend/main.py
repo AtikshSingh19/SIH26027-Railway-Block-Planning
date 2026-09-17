@@ -1047,27 +1047,56 @@ def get_plan_dashboard(plan_id: str):
         connection.close()
 
 
+def _apply_plan_status_transition(connection, plan_id: str, new_status: str):
+    """
+    Validate and apply a status transition on block_plans.
+
+    Only PENDING_REVIEW -> APPROVED and PENDING_REVIEW -> REJECTED are
+    allowed. APPROVED and REJECTED are terminal decisions: attempting to
+    move a plan out of either state is rejected with an HTTP 409 rather
+    than silently overwriting the existing human decision.
+
+    Does not commit; caller is responsible for committing once any
+    additional related updates (e.g. maintenance_requests) succeed.
+    """
+    plan = connection.execute(
+        "SELECT * FROM block_plans WHERE plan_id = ?",
+        (plan_id,),
+    ).fetchone()
+
+    if plan is None:
+        raise HTTPException(status_code=404, detail="Plan not found")
+
+    current_status = plan["status"]
+
+    if current_status != "PENDING_REVIEW":
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Plan {plan_id} is already {current_status} and cannot "
+                f"be changed to {new_status}."
+            ),
+        )
+
+    connection.execute(
+        "UPDATE block_plans SET status = ? WHERE plan_id = ?",
+        (new_status, plan_id),
+    )
+
+    return plan
+
+
 @app.post("/plans/{plan_id}/approve")
 def approve_plan(plan_id: str):
     connection = get_connection()
     try:
-        plan = connection.execute(
-            "SELECT * FROM block_plans WHERE plan_id = ?",
-            (plan_id,),
-        ).fetchone()
-
-        if plan is None:
-            raise HTTPException(status_code=404, detail="Plan not found")
-
-        connection.execute(
-            "UPDATE block_plans SET status = 'APPROVED' WHERE plan_id = ?",
-            (plan_id,),
-        )
+        _apply_plan_status_transition(connection, plan_id, "APPROVED")
 
         connection.execute(
             """
             UPDATE maintenance_requests
             SET planning_status = 'PLANNED',
+            status = 'APPROVED',
                 plan_id = ?
             WHERE id IN (
                 SELECT st.request_id
@@ -1107,21 +1136,17 @@ def approve_selected_plan(result: OptimizationResult):
         # save_optimization_result() assigns the real database ID
         plan_id = result.plan.plan_id
 
-        # Approve the saved plan
-        connection.execute(
-            """
-            UPDATE block_plans
-            SET status = 'APPROVED'
-            WHERE plan_id = ?
-            """,
-            (plan_id,),
-        )
+        # Approve the saved plan (freshly inserted rows are always
+        # PENDING_REVIEW, but the same guard is applied here for
+        # consistency with the other approve/reject paths).
+        _apply_plan_status_transition(connection, plan_id, "APPROVED")
 
         # Mark only requests belonging to this selected plan as planned
         connection.execute(
             """
             UPDATE maintenance_requests
             SET planning_status = 'PLANNED',
+            status = 'APPROVED',
                 plan_id = ?
             WHERE id IN (
                 SELECT st.request_id
@@ -1157,18 +1182,7 @@ def approve_selected_plan(result: OptimizationResult):
 def reject_plan(plan_id: str, payload: RejectPlanRequest = RejectPlanRequest()):
     connection = get_connection()
     try:
-        plan = connection.execute(
-            "SELECT * FROM block_plans WHERE plan_id = ?",
-            (plan_id,),
-        ).fetchone()
-
-        if plan is None:
-            raise HTTPException(status_code=404, detail="Plan not found")
-
-        connection.execute(
-            "UPDATE block_plans SET status = 'REJECTED' WHERE plan_id = ?",
-            (plan_id,),
-        )
+        _apply_plan_status_transition(connection, plan_id, "REJECTED")
         connection.commit()
 
         updated_plan = connection.execute(
@@ -1738,3 +1752,6 @@ def get_workflow_analytics():
         }
     finally:
         connection.close()
+
+
+
