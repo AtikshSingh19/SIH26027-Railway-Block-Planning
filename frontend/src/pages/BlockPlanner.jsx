@@ -155,6 +155,12 @@ const plannedApprovedRequests = approvedRequests.filter(
     return
   }
 
+  if (selectedRequestIds.length === 0) {
+    setErrorMessage('Please select at least one maintenance request.')
+    setProcessState('error')
+    return
+  }
+
   runFlow(() => api.optimizeFromDatabase(selectedRequestIds))
 }
 
@@ -377,6 +383,7 @@ const plannedApprovedRequests = approvedRequests.filter(
         payloadError={payloadError}
         objective={objective}
         onObjectiveChange={setObjective}
+        selectedRequestIds={selectedRequestIds}
       />
 
       {processState === 'error' ? (
