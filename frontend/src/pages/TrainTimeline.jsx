@@ -14,7 +14,6 @@ import CorridorTimelineRow from '../components/timeline/CorridorTimelineRow'
 import RouteGanttChart from '../components/timeline/RouteGanttChart'
 import { useFetch } from '../hooks/useFetch'
 import api from '../services/api'
-import { CORRIDORS } from '../utils/constants'
 import { severityTone, blockRequestStatusTone } from '../utils/status'
 import { formatDateTime, addMinutesToIso, formatDurationMins } from '../utils/formatters'
 
@@ -32,7 +31,7 @@ export default function TrainTimeline() {
 
 
   const [viewMode, setViewMode] = useState('gantt') // 'gantt' | 'cards'
-  const [corridor, setCorridor] = useState('')
+  const [selectedSectionId, setSelectedSectionId] = useState('')
   const [selectedItem, setSelectedItem] = useState(null)
   const [planDetails, setPlanDetails] = useState({})
   useEffect(() => {
@@ -76,25 +75,53 @@ const entries = results
   }
 }, [plans])
 
-  const corridorOptions = useMemo(() => {
-    if (!trains || !blockRequests) {
-      return CORRIDORS.map((c) => ({ value: c, label: c }))
+  const stationMap = useMemo(() => {
+    return Object.fromEntries((stations || []).map((s) => [s.id, s.name]))
+  }, [stations])
+
+  const sectionOptions = useMemo(() => {
+    if (!sections || sections.length === 0) {
+      return []
     }
-    const withData = new Set([...trains.map((t) => t.corridor), ...blockRequests.map((b) => b.corridor)])
-    const available = CORRIDORS.filter((c) => withData.has(c))
-    return (available.length > 0 ? available : CORRIDORS).map((c) => ({ value: c, label: c }))
-  }, [trains, blockRequests])
+    return sections.map((sec) => {
+      const src = stationMap[sec.source_station_id] || sec.source_station_id
+      const tgt = stationMap[sec.target_station_id] || sec.target_station_id
+      return {
+        value: sec.id,
+        label: `${sec.id}: ${src} → ${tgt}`,
+        sectionId: sec.id,
+        corridorLabel: `${src} → ${tgt}`,
+      }
+    })
+  }, [sections, stationMap])
+
+  // Default to first section when sections load if none selected
+  useEffect(() => {
+    if (sectionOptions.length > 0 && !selectedSectionId) {
+      setSelectedSectionId(sectionOptions[0].value)
+    }
+  }, [sectionOptions, selectedSectionId])
+
+  const corridorForSection = (sectionId) => {
+    const sec = (sections || []).find((x) => x.id === sectionId)
+    if (!sec) return sectionId
+    const src = stationMap[sec.source_station_id] || sec.source_station_id
+    const tgt = stationMap[sec.target_station_id] || sec.target_station_id
+    return `${sec.id}: ${src} → ${tgt}`
+  }
 
   const grouped = useMemo(() => {
     if (!trains || !blockRequests) return []
 
     const items = []
     trains.forEach((t) => {
+      if (!t.section_id) return
       items.push({
         id: `train-${t.id}`,
-        corridor: t.corridor,
+        section_id: t.section_id,
+        corridor: corridorForSection(t.section_id),
         label: `${t.type === 'freight' ? '🚆 Freight' : '🚆 Passenger'} ${t.id}`,
-        sub: t.name,
+        sub: `${t.name} (Sched: ${t.entry_time_min}m–${t.exit_time_min}m${t.delay_minutes > 0 ? `, Delay: +${t.delay_minutes}m` : ''})`,
         start: t.start,
         end: t.end,
         tone: 'rail',
@@ -102,12 +129,16 @@ const entries = results
         raw: t,
       })
     })
+
     blockRequests
       .filter((b) => INCLUDED_BLOCK_STATUSES.includes(b.status))
       .forEach((b) => {
+        const secId = b.sectionId || b.rawSectionId
+        if (!secId) return
         items.push({
           id: `block-${b.id}`,
-          corridor: b.corridor,
+          section_id: secId,
+          corridor: corridorForSection(secId),
           label: `🛠️ ${b.id}`,
           sub: `${b.department} · ${b.status}`,
           start: b.requestedStart,
@@ -118,61 +149,64 @@ const entries = results
         })
       })
 
-    const names = Object.fromEntries((stations || []).map((x) => [x.id, x.name]))
-
-const corridorForSection = (sectionId) => {
-  const sec = (sections || []).find((x) => x.id === sectionId)
-
-  return sec
-    ? `${names[sec.source_station_id]} → ${names[sec.target_station_id]}`
-    : sectionId
-}
-
     const approvedPlans = Object.values(planDetails || {})
-  .filter((detail) => detail?.plan?.status === 'APPROVED')
-  .sort(
-    (a, b) =>
-      new Date(b.plan.created_at) - new Date(a.plan.created_at)
-  )
+      .filter((detail) => detail?.plan?.status === 'APPROVED')
+      .sort(
+        (a, b) =>
+          new Date(b.plan.created_at) - new Date(a.plan.created_at)
+      )
 
-const currentPlan = approvedPlans[0]
+    const currentPlan = approvedPlans[0]
 
-if (currentPlan) {
-  currentPlan.blocks?.forEach((b) => {
-    const base = new Date(
-      `${currentPlan.plan.created_at.slice(0, 10)}T00:00:00`
-    )
-    base.setMinutes(Number(b.block_start_min))
+    if (currentPlan) {
+      currentPlan.blocks?.forEach((b) => {
+        if (!b.section_id) return
+        const base = new Date(
+          `${currentPlan.plan.created_at.slice(0, 10)}T00:00:00`
+        )
+        base.setMinutes(Number(b.block_start_min))
 
-    const end = new Date(
-      `${currentPlan.plan.created_at.slice(0, 10)}T00:00:00`
-    )
-    end.setMinutes(Number(b.block_end_min))
+        const end = new Date(
+          `${currentPlan.plan.created_at.slice(0, 10)}T00:00:00`
+        )
+        end.setMinutes(Number(b.block_end_min))
 
-    items.push({
-      id: `plan-block-${b.block_id}`,
-      corridor: corridorForSection(b.section_id),
-      label: `🛠️ ${b.block_id}`,
-      sub: `${currentPlan.plan.plan_name} · ${b.section_id}`,
-      start: base.toISOString().slice(0, 19),
-      end: end.toISOString().slice(0, 19),
-      tone: 'ai',
-      kind: 'plan-block',
-      raw: b,
-    })
-  })
-}
+        items.push({
+          id: `plan-block-${b.block_id}`,
+          section_id: b.section_id,
+          corridor: corridorForSection(b.section_id),
+          label: `🛠️ ${b.block_id}`,
+          sub: `${currentPlan.plan.plan_name} · ${b.section_id}`,
+          start: base.toISOString().slice(0, 19),
+          end: end.toISOString().slice(0, 19),
+          tone: 'ai',
+          kind: 'plan-block',
+          raw: b,
+        })
+      })
+    }
 
-    const byCorridor = {}
+    const bySection = {}
     items.forEach((item) => {
-      if (!byCorridor[item.corridor]) byCorridor[item.corridor] = []
-      byCorridor[item.corridor].push(item)
+      const sId = item.section_id
+      if (!sId) return
+      if (!bySection[sId]) bySection[sId] = []
+      bySection[sId].push(item)
     })
 
-    return CORRIDORS.filter((c) => byCorridor[c] && byCorridor[c].length > 0)
-      .filter((c) => !corridor || c === corridor)
-      .map((c) => ({ corridor: c, items: byCorridor[c] }))
-  }, [trains, blockRequests, corridor, planDetails, sections, stations])
+    const activeSections = sections && sections.length > 0
+      ? sections.map((s) => s.id)
+      : Object.keys(bySection)
+
+    return activeSections
+      .filter((secId) => bySection[secId] && bySection[secId].length > 0)
+      .filter((secId) => !selectedSectionId || secId === selectedSectionId)
+      .map((secId) => ({
+        sectionId: secId,
+        corridor: corridorForSection(secId),
+        items: bySection[secId],
+      }))
+  }, [trains, blockRequests, selectedSectionId, planDetails, sections, stations])
 
   const loading = trainsLoading || requestsLoading
 
@@ -226,9 +260,9 @@ if (currentPlan) {
           blockRequests={blockRequests || []}
           plans={plans || []}
           planDetails={planDetails}
-          selectedCorridor={corridor}
-          onSelectCorridor={setCorridor}
-          corridorOptions={corridorOptions}
+          selectedSectionId={selectedSectionId}
+          onSelectSection={setSelectedSectionId}
+          sectionOptions={sectionOptions}
           onSelectItem={setSelectedItem}
         />
       ) : (
@@ -237,11 +271,11 @@ if (currentPlan) {
             <FilterBar
               filters={[
                 {
-                  key: 'corridor',
-                  label: 'Corridor',
-                  value: corridor,
-                  onChange: setCorridor,
-                  options: corridorOptions,
+                  key: 'section',
+                  label: 'Railway Section',
+                  value: selectedSectionId,
+                  onChange: setSelectedSectionId,
+                  options: [{ value: '', label: 'All Sections' }, ...sectionOptions],
                 },
               ]}
             />
@@ -253,7 +287,7 @@ if (currentPlan) {
           ) : (
             <div className="flex flex-col gap-4">
               {grouped.map((g) => (
-                <CorridorTimelineRow key={g.corridor} corridor={g.corridor} items={g.items} onSelect={setSelectedItem} />
+                <CorridorTimelineRow key={g.sectionId || g.corridor} corridor={g.corridor} items={g.items} onSelect={setSelectedItem} />
               ))}
             </div>
           )}
