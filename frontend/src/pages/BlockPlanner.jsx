@@ -11,6 +11,7 @@ import SeparateVsCoordinatedCard from '../components/optimization/SeparateVsCoor
 import BlockTasksPanelContent from '../components/optimization/BlockTasksPanelContent'
 import HumanApprovalBar from '../components/optimization/HumanApprovalBar'
 import api from '../services/api'
+import { useWorkflow } from '../context/WorkflowContext'
 import { buildSampleOptimizationPayload, sampleSections, sampleStations, sampleTrains as sampleTrainsForPlanner, sampleDisruptions } from '../data/sampleOptimizationPayload'
 import { formatMinutesToTime } from '../utils/backendFormatters'
 import { buildSectionMap, buildStationNameMap, sectionRouteLabel } from '../utils/sectionLabels'
@@ -35,21 +36,21 @@ export default function BlockPlanner() {
   const [reviewStatus, setReviewStatus] = useState(null) // null | 'approved' | 'rejected'
   const [selectedBlock, setSelectedBlock] = useState(null)
   const [reoptimizing, setReoptimizing] = useState(false)
-
-    async function loadMaintenanceRequests() {
-    try {
-      const requests = await api.getMaintenanceRequests()
-      setMaintenanceRequests(requests)
-      return requests
-    } catch (err) {
-      console.error('Failed to refresh maintenance requests:', err)
-      return null
-    }
-  }
-
+  const workflow = useWorkflow()
   useEffect(() => {
-    loadMaintenanceRequests()
-  }, [])
+  async function loadMaintenanceRequests() {
+  try {
+    const requests = await api.getMaintenanceRequests()
+    setMaintenanceRequests(requests)
+    return requests
+  } catch (err) {
+    console.error('Failed to refresh maintenance requests:', err)
+    return null
+  }
+}
+
+  loadMaintenanceRequests()
+}, [])
 
   const [selectedRequestIds, setSelectedRequestIds] = useState([])
   const [objective, setObjective] = useState('BALANCED')
@@ -99,26 +100,26 @@ const plannedApprovedRequests = approvedRequests.filter(
   try {
     const res = await apiCall()
 
-const plans = Array.isArray(res) ? res : [res]
+      const plans = Array.isArray(res) ? res : [res]
 
-const normalizedPlans = plans.map((item) => {
-  if (item?.result) {
-    return {
-      ...item.result,
-      fallback_plan_id: item.plan_id,
-      fallback_plan_name: item.plan_name,
-      robustness_score: item.robustness_score,
-      robustness_breakdown: item.breakdown,
-    }
-  }
+      const normalizedPlans = plans.map((item) => {
+        if (item?.result) {
+          return {
+            ...item.result,
+            fallback_plan_id: item.plan_id,
+            fallback_plan_name: item.plan_name,
+            robustness_score: item.robustness_score,
+            robustness_breakdown: item.breakdown,
+          }
+        }
 
-  return item
-})
+        return item
+      })
 
-setAvailablePlans(normalizedPlans)
-setSelectedPlanIndex(0)
-setResult(normalizedPlans[0] || null)
-setProcessState('success')
+      setAvailablePlans(normalizedPlans)
+      setSelectedPlanIndex(0)
+      setResult(normalizedPlans[0] || null)
+      setProcessState('success')
 
     // Refresh is secondary; don't let it turn a successful
     // optimization into an "Optimization failed" state.
@@ -171,73 +172,90 @@ setProcessState('success')
     runFlow(() => api.optimize(parsed))
   }
 
-    async function handleReoptimize() {
-  setReoptimizing(true)
-  try {
-    const res =
-      lastMode === 'custom' && lastSubmittedPayload
-        ? await api.optimize(lastSubmittedPayload)
-        : await api.optimizeFromDatabase()
+  async function handleReoptimize() {
+    setReoptimizing(true)
+    try {
+      const res =
+        lastMode === 'custom' && lastSubmittedPayload
+          ? await api.optimize(lastSubmittedPayload)
+          : await api.optimizeFromDatabase()
+      const plans = Array.isArray(res) ? res : [res]
 
-    const plans = Array.isArray(res) ? res : [res]
-
-    const normalizedPlans = plans.map((item) => {
-      if (item?.result) {
-        return {
-          ...item.result,
-          fallback_plan_id: item.plan_id,
-          fallback_plan_name: item.plan_name,
-          robustness_score: item.robustness_score,
-          robustness_breakdown: item.breakdown,
+      const normalizedPlans = plans.map((item) => {
+        if (item?.result) {
+          return {
+            ...item.result,
+            fallback_plan_id: item.plan_id,
+            fallback_plan_name: item.plan_name,
+            robustness_score: item.robustness_score,
+            robustness_breakdown: item.breakdown,
+          }
         }
-      }
 
-      return item
-    })
+        return item
+      })
 
-    setAvailablePlans(normalizedPlans)
-    setSelectedPlanIndex(0)
-    setResult(normalizedPlans[0] || null)
-    setReviewStatus(null)
-  } catch (err) {
-    setErrorMessage(
-      err?.response?.data?.detail ||
-      err.message ||
-      'Re-optimization failed.'
-    )
-    setProcessState('error')
-  } finally {
-    setReoptimizing(false)
+      setAvailablePlans(normalizedPlans)
+      setSelectedPlanIndex(0)
+      setResult(normalizedPlans[0] || null)
+      setReviewStatus(null)
+    } catch (err) {
+      setErrorMessage(err?.response?.data?.detail || err.message || 'Re-optimization failed.')
+      setProcessState('error')
+    } finally {
+      setReoptimizing(false)
+    }
   }
-}
-
-
 
   async function handleApprovePlan() {
     console.log('APPROVE CLICKED', result?.plan?.plan_id)
-  if (!result?.plan?.plan_id) {
 
-    setErrorMessage('No plan is available to approve.')
-    return
+    if (!result?.plan?.plan_id) {
+      setErrorMessage('No plan is available to approve.')
+      return
+    }
+
+    try {
+      const res = await api.approvePlan(result)
+
+      setResult((current) => ({
+        ...current,
+        plan: res.plan,
+      }))
+
+      setReviewStatus('approved')
+    } catch (err) {
+      setErrorMessage(
+        err?.response?.data?.detail ||
+        err.message ||
+        'Plan approval failed.'
+      )
+    }
   }
 
-  try {
-    const res = await api.approvePlan(result)
+  async function handleRejectPlan() {
+    if (!result?.plan?.plan_id) {
+      setErrorMessage('No plan is available to reject.')
+      return
+    }
 
-    setResult((current) => ({
-      ...current,
-      plan: res.plan,
-    }))
+    try {
+      const res = await api.rejectPlan(result.plan.plan_id)
 
-    setReviewStatus('approved')
-  } catch (err) {
-    setErrorMessage(
-      err?.response?.data?.detail ||
-      err.message ||
-      'Plan approval failed.'
-    )
+      setResult((current) => ({
+        ...current,
+        plan: res.plan,
+      }))
+
+      setReviewStatus('rejected')
+    } catch (err) {
+      setErrorMessage(
+        err?.response?.data?.detail ||
+        err.message ||
+        'Plan rejection failed.'
+      )
+    }
   }
-}
 
   const blockColumns = [
     { key: 'block_id', header: 'block_id', render: (b) => <span className="font-mono text-xs">{b.block_id}</span> },
@@ -371,7 +389,7 @@ setProcessState('success')
 ) : null}
 
 
-
+          
       </section>
 
       <OptimizationTriggerPanel
@@ -395,71 +413,73 @@ setProcessState('success')
 
       {result && (processState === 'success' || reoptimizing) ? (
         <>
-	{availablePlans.length > 1 ? (
-  <section className="bg-surface-1 border border-surface-3 rounded p-4">
-    <SectionHeader
-      title="Generated Plans"
-      subtitle="Select a plan to review its schedule and optimization details."
-    />
 
-    <div className="grid grid-cols-1 md:grid-cols-3 gap-3 mt-4">
-      {availablePlans.map((plan, index) => (
-        <button
-          key={plan.plan?.plan_id || plan.fallback_plan_id || index}
-          type="button"
-          onClick={() => {
-            setSelectedPlanIndex(index)
-            setResult(plan)
-            setReviewStatus(null)
-          }}
-          className={`text-left border rounded p-4 transition ${
-            selectedPlanIndex === index
-              ? 'border-ai bg-ai-muted'
-              : 'border-surface-3 bg-surface-1 hover:border-ai/50'
-          }`}
-        >
-          <div className="text-sm font-medium text-ink-primary">
-            {plan.plan?.plan_name || plan.fallback_plan_name || 'Optimization Plan'}
-          </div>
+        {availablePlans.length > 1 ? (
+          <section className="bg-surface-1 border border-surface-3 rounded p-4">
+            <SectionHeader
+              title="Generated Plans"
+              subtitle="Select a plan to review its schedule and optimization details."
+            />
 
-          <div className="text-xs text-ink-faint mt-1">
-            {plan.plan?.objective_type || '—'}
-          </div>
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-3 mt-4">
+              {availablePlans.map((plan, index) => (
+                <button
+                  key={plan.plan?.plan_id || plan.fallback_plan_id || index}
+                  type="button"
+                  onClick={() => {
+                    setSelectedPlanIndex(index)
+                    setResult(plan)
+                    setReviewStatus(null)
+                  }}
+                  className={`text-left border rounded p-4 transition ${
+                    selectedPlanIndex === index
+                      ? 'border-ai bg-ai-muted'
+                      : 'border-surface-3 bg-surface-1 hover:border-ai/50'
+                  }`}
+                >
+                  <div className="text-sm font-medium text-ink-primary">
+                    {plan.plan?.plan_name || plan.fallback_plan_name || 'Optimization Plan'}
+                  </div>
 
-          <div className="grid grid-cols-2 gap-2 mt-3 text-xs">
-            <div>
-              <div className="text-ink-faint">Robustness</div>
-              <div className="font-medium text-ink-primary">
-                {plan.robustness_score ?? '—'}
-              </div>
+                  <div className="text-xs text-ink-faint mt-1">
+                    {plan.plan?.objective_type || '—'}
+                  </div>
+
+                  <div className="grid grid-cols-2 gap-2 mt-3 text-xs">
+                    <div>
+                      <div className="text-ink-faint">Robustness</div>
+                      <div className="font-medium text-ink-primary">
+                        {plan.robustness_score ?? '—'}
+                      </div>
+                    </div>
+
+                    <div>
+                      <div className="text-ink-faint">Blocks</div>
+                      <div className="font-medium text-ink-primary">
+                        {plan.plan?.total_blocks_count ?? '—'}
+                      </div>
+                    </div>
+
+                    <div>
+                      <div className="text-ink-faint">Train delay</div>
+                      <div className="font-medium text-ink-primary">
+                        {formatMinutesToTime(plan.plan?.total_train_delay_min ?? 0)}
+                      </div>
+                    </div>
+
+                    <div>
+                      <div className="text-ink-faint">Window shift</div>
+                      <div className="font-medium text-ink-primary">
+                        {formatMinutesToTime(plan.plan?.total_window_shift_min ?? 0)}
+                      </div>
+                    </div>
+                  </div>
+                </button>
+              ))}
             </div>
+          </section>
+        ) : null}
 
-            <div>
-              <div className="text-ink-faint">Blocks</div>
-              <div className="font-medium text-ink-primary">
-                {plan.plan?.total_blocks_count ?? '—'}
-              </div>
-            </div>
-
-            <div>
-              <div className="text-ink-faint">Train delay</div>
-              <div className="font-medium text-ink-primary">
-                {formatMinutesToTime(plan.plan?.total_train_delay_min ?? 0)}
-              </div>
-            </div>
-
-            <div>
-              <div className="text-ink-faint">Window shift</div>
-              <div className="font-medium text-ink-primary">
-                {formatMinutesToTime(plan.plan?.total_window_shift_min ?? 0)}
-              </div>
-            </div>
-          </div>
-        </button>
-      ))}
-    </div>
-  </section>
-) : null}
           <section>
             <SectionHeader title="Plan summary" subtitle={result.plan.plan_name} />
             <PlanSummaryCards plan={result.plan} />
@@ -493,7 +513,7 @@ setProcessState('success')
           <HumanApprovalBar
             reviewStatus={reviewStatus}
             onApprove={handleApprovePlan}
-            onReject={() => setReviewStatus('rejected')}
+            onReject={handleRejectPlan}
             onModify={() => {
               setLastMode('custom')
               document.getElementById('root')?.scrollIntoView({ behavior: 'smooth' })
