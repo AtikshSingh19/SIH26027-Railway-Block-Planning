@@ -41,63 +41,96 @@ export default function RouteGanttChart({
   // Current active corridor
   const activeCorridor = selectedCorridor || (corridorOptions[0]?.value ?? 'New Delhi → Ghaziabad')
 
-  // Filter trains for active corridor
-  const corridorTrains = useMemo(() => {
-    return (trains || []).filter((t) => {
-      if (!t.corridor) return true
-      return t.corridor.toLowerCase().includes(activeCorridor.toLowerCase()) ||
-        activeCorridor.toLowerCase().includes(t.corridor.toLowerCase())
-    })
-  }, [trains, activeCorridor])
+  // Map UI corridor labels to backend corridor names
+const corridorAliases = {
+  'NDLS–GZB (Up)': 'New Delhi → Ghaziabad',
+  'NDLS–GZB (Down)': 'Ghaziabad → New Delhi',
+  'CNB–ALD Main': 'Kanpur → Aligarh',
+  'MGS–DDU Loop': 'Mughalsarai → DDU',
+  'BSB–MGS Ghat': 'Varanasi → Mughalsarai',
+  'ALD–PRG Cord': 'Aligarh → Prayagraj',
+}
 
-  // Extract planned blocks and manual block requests for active corridor
-  const corridorBlocks = useMemo(() => {
-    const blocks = []
+const backendCorridor = corridorAliases[activeCorridor] || activeCorridor
+const corridorTrains = useMemo(() => {
+  return (trains || []).filter((t) => {
+    if (!t.corridor) return true
 
-    // 1. From active backend plans
-    Object.values(planDetails || {}).forEach((detail) => {
-      (detail.blocks || []).forEach((b) => {
-        blocks.push({
-          id: b.block_id,
-          source: 'AI_PLAN',
-          planName: detail.plan?.plan_name || 'AI Optimized Plan',
-          sectionId: b.section_id,
-          startMin: Number(b.block_start_min),
-          endMin: Number(b.block_end_min),
-          durationMin: Number(b.block_end_min) - Number(b.block_start_min),
-          department: 'BUNDLED',
-          departmentLabel: 'Multi-Department Bundled',
-          tasks: (detail.scheduled_tasks || []).filter((st) => st.block_id === b.block_id),
-          tone: 'ai',
-        })
+    const trainCorridor = t.corridor.toLowerCase()
+    const selectedCorridor = backendCorridor.toLowerCase()
+
+    return (
+      trainCorridor.includes(selectedCorridor) ||
+      selectedCorridor.includes(trainCorridor)
+    )
+  })
+}, [trains, backendCorridor])
+// Filter trains for active corridor
+const corridorBlocks = useMemo(() => {
+  const blocks = []
+
+  const approvedPlans = Object.values(planDetails || {})
+    .filter((detail) => detail?.plan?.status === 'APPROVED')
+    .sort(
+      (a, b) =>
+        new Date(b.plan.created_at) - new Date(a.plan.created_at)
+    )
+
+  const currentPlan = approvedPlans[0]
+
+  if (currentPlan) {
+    currentPlan.blocks?.forEach((b) => {
+      blocks.push({
+        id: b.block_id,
+        source: 'AI_PLAN',
+        planName: currentPlan.plan?.plan_name || 'AI Optimized Plan',
+        sectionId: b.section_id,
+        startMin: Number(b.block_start_min),
+        endMin: Number(b.block_end_min),
+        durationMin:
+          Number(b.block_end_min) - Number(b.block_start_min),
+        department: 'BUNDLED',
+        departmentLabel: 'Multi-Department Bundled',
+        tasks: (currentPlan.scheduled_tasks || []).filter(
+          (st) => st.block_id === b.block_id
+        ),
+        tone: 'ai',
       })
     })
+  }
 
-    // 2. From approved block requests if no plan blocks found
-    if (blocks.length === 0 && blockRequests) {
-      blockRequests
-        .filter((b) => !b.corridor || b.corridor.toLowerCase().includes(activeCorridor.toLowerCase()) || activeCorridor.toLowerCase().includes(b.corridor.toLowerCase()))
-        .forEach((b) => {
-          const reqStart = new Date(b.requestedStart)
-          const startMin = reqStart.getHours() * 60 + reqStart.getMinutes()
-          blocks.push({
-            id: b.id,
-            source: 'BLOCK_REQUEST',
-            planName: `Request ${b.id}`,
-            sectionId: b.sectionId || 'SEC001',
-            startMin: startMin,
-            endMin: startMin + Number(b.durationMins || 60),
-            durationMin: Number(b.durationMins || 60),
-            department: b.department || 'TRACK',
-            departmentLabel: b.department || 'Engineering',
-            tasks: b.taskIds || [],
-            tone: b.status === 'Conflict' ? 'critical' : 'ai',
-          })
+  // From approved block requests if no plan blocks found
+  if (blocks.length === 0 && blockRequests) {
+    blockRequests
+      .filter(
+        (b) =>
+          !b.corridor ||
+          b.corridor.toLowerCase().includes(backendCorridor.toLowerCase()) ||
+backendCorridor.toLowerCase().includes(b.corridor.toLowerCase())
+      )
+      .forEach((b) => {
+        const reqStart = new Date(b.requestedStart)
+        const startMin =
+          reqStart.getHours() * 60 + reqStart.getMinutes()
+
+        blocks.push({
+          id: b.id,
+          source: 'BLOCK_REQUEST',
+          planName: `Request ${b.id}`,
+          sectionId: b.sectionId || 'SEC001',
+          startMin,
+          endMin: startMin + Number(b.durationMins || 60),
+          durationMin: Number(b.durationMins || 60),
+          department: b.department || 'TRACK',
+          departmentLabel: b.department || 'Engineering',
+          tasks: b.taskIds || [],
+          tone: b.status === 'Conflict' ? 'critical' : 'ai',
         })
-    }
+      })
+  }
 
-    return blocks
-  }, [planDetails, blockRequests, activeCorridor])
+  return blocks
+}, [planDetails, blockRequests, backendCorridor])
 
   // Time window configuration
   const { windowMin, windowMax, totalMinutes } = useMemo(() => {
