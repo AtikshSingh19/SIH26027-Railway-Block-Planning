@@ -28,7 +28,6 @@ export default function OptimizationTriggerPanel({
             in the database.
           </p>
         </div>
-        <label className="flex items-center gap-2 text-xs text-ink-secondary">Objective<select value={objective} onChange={(e) => onObjectiveChange(e.target.value)} className="bg-surface-2 border border-surface-3 rounded px-2 py-1.5 text-xs text-ink-primary"><option value="MIN_DELAY">Minimize train delay</option><option value="MIN_BLOCKS">Minimize maintenance blocks</option><option value="BALANCED">Balanced optimization</option></select></label>
         <Button variant="ai" icon={Sparkles} onClick={onGenerateFromDatabase} disabled={isBusy || !hasSelectedRequests}>
           {isBusy ? 'Optimizing…' : 'Generate Optimized Plan'}
         </Button>

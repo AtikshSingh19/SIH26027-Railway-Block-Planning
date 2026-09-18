@@ -1,200 +1,178 @@
-import sqlite3
-from pathlib import Path
+import os
+import uuid
 
+import psycopg
+from dotenv import load_dotenv
+from psycopg.rows import dict_row
 
-# database folder
-BASE_DIR = Path(__file__).resolve().parent
+load_dotenv()
 
-# SQLite database file
-DATABASE_PATH = BASE_DIR / "railway.db"
+DATABASE_URL = os.getenv("DATABASE_URL")
 
-# SQL files
-SCHEMA_PATH = BASE_DIR / "schema.sql"
-SEED_PATH = BASE_DIR / "seed.sql"
+if not DATABASE_URL:
+    raise RuntimeError(
+        "DATABASE_URL is not set. Please add it to your .env file."
+    )
 
 
 def get_connection():
-    """
-    Create and return a connection to the SQLite database.
-    """
-
-    connection = sqlite3.connect(DATABASE_PATH)
-
-    # Return rows that can be accessed by column name
-    connection.row_factory = sqlite3.Row
-
-    # Enable foreign key constraints
-    connection.execute("PRAGMA foreign_keys = ON")
-
-    return connection
+    """Create and return a PostgreSQL connection to Supabase."""
+    return psycopg.connect(
+        DATABASE_URL,
+        row_factory=dict_row,
+    )
 
 
 def initialize_database():
-    """
-    Create database tables and insert initial seed data.
-    """
-
-    connection = get_connection()
-
-    try:
-        # Create tables
-        schema_sql = SCHEMA_PATH.read_text(encoding="utf-8")
-        connection.executescript(schema_sql)
-
-        # Check whether seed data already exists
-        cursor = connection.execute(
-            "SELECT COUNT(*) FROM stations"
-        )
-
-        station_count = cursor.fetchone()[0]
-
-        # Insert seed data only if database is empty
-        if station_count == 0:
-            seed_sql = SEED_PATH.read_text(encoding="utf-8")
-            connection.executescript(seed_sql)
-
-        connection.commit()
-
-    finally:
-        connection.close()
-
-    migrate_database()
-
+    """Verify that the Supabase PostgreSQL database is reachable."""
+    with get_connection() as connection:
+        connection.execute("SELECT 1")
 
 
 def save_optimization_result(connection, result, plan_id=None):
-
     plan = result.plan
+    blocks = getattr(result, "blocks", []) or []
+    scheduled_tasks = getattr(result, "scheduled_tasks", []) or []
+    explanations = getattr(result, "explanations", []) or []
 
-    if plan_id is None:
-        existing_count = connection.execute(
-            "SELECT COUNT(*) FROM block_plans"
-        ).fetchone()[0]
-
-        new_plan_id = f"PLAN_{existing_count + 1:03d}"
-    else:
-        new_plan_id = plan_id
-
-    plan.plan_id = new_plan_id
-
-    connection.execute(
-        """
-        INSERT INTO block_plans (
-            plan_id,
-            plan_name,
-            objective_type,
-            baseline_blocks_count,
-            total_blocks_count,
-            blocks_saved,
-            total_wait_time_min,
-            total_train_delay_min,
-            total_window_shift_min,
-            created_at,
-            status
+    with connection.transaction():
+        # 1. Determine Plan ID
+        new_plan_id = (
+            plan_id
+            if plan_id is not None
+            else f"PLAN_{uuid.uuid4().hex[:12].upper()}"
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            new_plan_id,
-            plan.plan_name,
-            plan.objective_type.value
-            if hasattr(plan.objective_type, "value")
-            else plan.objective_type,
-            plan.baseline_blocks_count,
-            plan.total_blocks_count,
-            plan.blocks_saved,
-            plan.total_wait_time_min,
-            plan.total_train_delay_min,
-            getattr(plan, "total_window_shift_min", 0),
-            plan.created_at,
-            "PENDING_REVIEW",
-        )
-    )
 
-    for block in result.blocks:
+        plan.plan_id = new_plan_id
 
-        block_number = block.block_id.split("_B")[-1]
-        new_block_id = f"{new_plan_id}_B{block_number}"
-
+        # 2. Insert Block Plan
         connection.execute(
             """
-            INSERT INTO maintenance_blocks (
-                block_id,
+            INSERT INTO block_plans (
                 plan_id,
-                section_id,
-                block_start_min,
-                block_end_min
+                plan_name,
+                objective_type,
+                baseline_blocks_count,
+                total_blocks_count,
+                blocks_saved,
+                total_wait_time_min,
+                total_train_delay_min,
+                total_window_shift_min,
+                status
             )
-            VALUES (?, ?, ?, ?, ?)
+            VALUES (
+                %s, %s, %s, %s, %s,
+                %s, %s, %s, %s, %s
+            )
             """,
             (
-                new_block_id,
-                new_plan_id,
-                block.section_id,
-                block.block_start_min,
-                block.block_end_min,
-            )
+                plan.plan_id,
+                getattr(plan, "plan_name", f"Plan {plan.plan_id}"),
+                plan.objective_type,
+                getattr(plan, "baseline_blocks_count", 0),
+                getattr(plan, "total_blocks_count", len(blocks)),
+                getattr(plan, "blocks_saved", 0),
+                plan.total_wait_time_min,
+                plan.total_train_delay_min,
+                plan.total_window_shift_min,
+                getattr(plan, "status", "PENDING_REVIEW"),
+            ),
         )
 
-    for task in result.scheduled_tasks:
-
-        task_block_number = task.block_id.split("_B")[-1]
-        new_task_block_id = f"{new_plan_id}_B{task_block_number}"
-
-        connection.execute(
-            """
-            INSERT INTO scheduled_tasks (
-                request_id,
-                block_id,
-                scheduled_start_min,
-                scheduled_end_min,
-                duration_min,
-                start_deviation_min
+        # 3. Insert Maintenance Blocks
+        for block in blocks:
+            connection.execute(
+                """
+                INSERT INTO maintenance_blocks (
+                    block_id,
+                    plan_id,
+                    section_id,
+                    block_start_min,
+                    block_end_min
+                )
+                VALUES (%s, %s, %s, %s, %s)
+                """,
+                (
+                    block.block_id,
+                    plan.plan_id,
+                    block.section_id,
+                    block.block_start_min,
+                    block.block_end_min,
+                ),
             )
-            VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (
-                task.request_id,
-                new_task_block_id,
-                task.scheduled_start_min,
-                task.scheduled_end_min,
-                task.duration_min,
-                task.start_deviation_min,
-            )
-        )
 
-    for explanation in result.explanations:
+        # 4. Insert Scheduled Tasks
+        for task in scheduled_tasks:
+            duration = getattr(task, "duration_min", None)
 
-        connection.execute(
-            """
-            INSERT INTO plan_explanations (
-                plan_id,
-                explanation_text
-            )
-            VALUES (?, ?)
-            """,
-            (
-                new_plan_id,
-                explanation.explanation_text,
-            )
-        )
+            if duration is None:
+                duration = (
+                    task.scheduled_end_min
+                    - task.scheduled_start_min
+                )
 
-    connection.commit()
-    
+            deviation = getattr(
+                task,
+                "start_deviation_min",
+                0,
+            )
+
+            connection.execute(
+                """
+                INSERT INTO scheduled_tasks (
+                    request_id,
+                    block_id,
+                    scheduled_start_min,
+                    scheduled_end_min,
+                    duration_min,
+                    start_deviation_min
+                )
+                VALUES (%s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    task.request_id,
+                    task.block_id,
+                    task.scheduled_start_min,
+                    task.scheduled_end_min,
+                    duration,
+                    deviation,
+                ),
+            )
+
+        # 5. Insert Plan Explanations
+        for explanation in explanations:
+            connection.execute(
+                """
+                INSERT INTO plan_explanations (
+                    plan_id,
+                    explanation_text
+                )
+                VALUES (%s, %s)
+                """,
+                (
+                    plan.plan_id,
+                    explanation.explanation_text,
+                ),
+            )
 
 
 def migrate_database():
-    """
-    Apply small schema updates to an existing database.
-    Safe to run repeatedly.
-    """
+    """Apply small schema updates to the existing Supabase PostgreSQL database."""
     connection = get_connection()
 
     try:
+        connection.autocommit = True
+
+        # Check maintenance_requests columns
         maintenance_columns = {
-            row["name"]
+            row["column_name"]
             for row in connection.execute(
-                "PRAGMA table_info(maintenance_requests)"
+                """
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_schema = 'public'
+                  AND table_name = 'maintenance_requests'
+                """
             ).fetchall()
         }
 
@@ -202,8 +180,7 @@ def migrate_database():
             connection.execute(
                 """
                 ALTER TABLE maintenance_requests
-                ADD COLUMN status TEXT NOT NULL DEFAULT 'PENDING'
-                CHECK(status IN ('PENDING', 'APPROVED', 'REJECTED'))
+                ADD COLUMN status VARCHAR(50)
                 """
             )
 
@@ -223,10 +200,16 @@ def migrate_database():
                 """
             )
 
+        # Check block_plans columns
         block_plan_columns = {
-            row["name"]
+            row["column_name"]
             for row in connection.execute(
-                "PRAGMA table_info(block_plans)"
+                """
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_schema = 'public'
+                  AND table_name = 'block_plans'
+                """
             ).fetchall()
         }
 
@@ -234,11 +217,10 @@ def migrate_database():
             connection.execute(
                 """
                 ALTER TABLE block_plans
-                ADD COLUMN total_window_shift_min REAL NOT NULL DEFAULT 0.0
+                ADD COLUMN total_window_shift_min REAL
+                NOT NULL DEFAULT 0.0
                 """
             )
-
-        connection.commit()
 
     finally:
         connection.close()

@@ -91,43 +91,38 @@ export default function MaintenanceRecords() {
   const [newRequestModalOpen, setNewRequestModalOpen] = useState(false)
   const [myRequestsOpen, setMyRequestsOpen] = useState(false)
 
-  // "My Requests" needs to read live backend state (status, planning_status,
-  // plan_id) rather than only the local workflowStore copy: that local copy
-  // is written once on request creation and is never updated when a request
-  // or its plan is later approved/rejected on the backend, so it would show
-  // a stale PENDING forever otherwise.
+  // "My Requests" reads live backend state (status, planning_status,
+  // plan_id) rather than only the local workflowStore copy.
   const { data: backendMaintenanceRequests, refetch: refetchMaintenanceRequests } = useFetch(
     () => api.getMaintenanceRequests(),
     [],
   )
 
-const myRequests = useMemo(() => {
-  const requests = workflow.getMyRequests(user?.name)
-  const entries = Array.isArray(requests) ? requests : []
-  const liveById = new Map((backendMaintenanceRequests || []).map((r) => [r.id, r]))
+  const myRequests = useMemo(() => {
+    const requests = workflow.getMyRequests(user?.name)
+    const entries = Array.isArray(requests) ? requests : []
+    const liveById = new Map((backendMaintenanceRequests || []).map((r) => [r.id, r]))
 
-  return entries.map((entry) => {
-    const live = liveById.get(entry.id)
-    if (!live) return entry
+    return entries.map((entry) => {
+      const live = liveById.get(entry.id)
+      if (!live) return entry
 
-    // Backend is the source of truth for approval/planning state; the local
-    // workflow entry only supplies display metadata (requestedBy,
-    // description, createdAt) that the backend doesn't store. A request
-    // that's APPROVED and already linked into an approved plan is shown as
-    // SCHEDULED, matching the status this app already displays for that case.
-    const status =
-      live.status === 'APPROVED' && live.planning_status === 'PLANNED'
-        ? 'SCHEDULED'
-        : live.status
+      // Backend is the source of truth for approval/planning state.
+      // A request that's APPROVED and already linked into an approved plan is shown as
+      // SCHEDULED.
+      const status =
+        live.status === 'APPROVED' && live.planning_status === 'PLANNED'
+          ? 'SCHEDULED'
+          : live.status
 
-    return {
-      ...entry,
-      status,
-      rejectionReason: live.rejection_reason ?? entry.rejectionReason,
-      planId: live.plan_id ?? null,
-    }
-  })
-}, [workflow, user?.name, backendMaintenanceRequests])
+      return {
+        ...entry,
+        status,
+        rejectionReason: live.rejection_reason ?? entry.rejectionReason,
+        planId: live.plan_id ?? null,
+      }
+    })
+  }, [workflow, user?.name, backendMaintenanceRequests])
 
   async function handleSubmitNewRequest(request, meta) {
     await api.createMaintenanceRequest(request, { ...meta, requestedBy: user?.name || 'Employee' })
@@ -136,7 +131,6 @@ const myRequests = useMemo(() => {
     refetchTasks()
     refetchBlockRequests()
     refetchMaintenanceRequests()
-    
   }
 
   function closeReviewAndRefresh() {
@@ -343,7 +337,6 @@ const myRequests = useMemo(() => {
         onClose={() => setMyRequestsOpen(false)}
         title="My Requests"
         subtitle="Maintenance requests from the backend"
-
       >
         <MyRequestsPanel entries={myRequests} sectionsById={sectionsById} stationNameMap={stationNameMap} />
       </SidePanel>

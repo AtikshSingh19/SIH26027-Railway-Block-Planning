@@ -1,8 +1,7 @@
 import datetime
+import uuid
 from contextlib import asynccontextmanager
 from typing import Dict, List, Optional
-from ml_inference import apply_ml_predictions
-from replanner import generate_fallback_plans_from_ml
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -13,13 +12,15 @@ from database.connection import (
     initialize_database,
     save_optimization_result,
 )
-from logic import solve_block_schedule, OptimizationResult
+from logic import OptimizationResult, solve_block_schedule
+from ml_inference import apply_ml_predictions
 from models import (
     Disruption,
     MaintenanceRequest,
     Section,
     TrainSchedule,
 )
+from replanner import generate_fallback_plans_from_ml
 
 
 @asynccontextmanager
@@ -83,6 +84,53 @@ def label_to_dept(label: str) -> str:
     return mapping.get(label, label)
 
 
+def generate_plan_id() -> str:
+    """Generates a unique plan ID to prevent collisions across clients."""
+    return f"PLAN_{uuid.uuid4().hex[:12].upper()}"
+
+
+def assign_plan_id(result: OptimizationResult, plan_id: str) -> None:
+    """Recursively updates plan_id across blocks, scheduled tasks, and explanations."""
+    result.plan.plan_id = plan_id
+
+    for block in result.blocks:
+        block.plan_id = plan_id
+        block_number = block.block_id.split("_B")[-1]
+        block.block_id = f"{plan_id}_B{block_number}"
+
+    for task in result.scheduled_tasks:
+        block_number = task.block_id.split("_B")[-1]
+        task.block_id = f"{plan_id}_B{block_number}"
+
+    for explanation in result.explanations:
+        explanation.plan_id = plan_id
+
+
+def claim_maintenance_requests(connection, request_ids: List[str]) -> List[str]:
+    """
+    Atomically transitions requested rows from UNPLANNED -> PLANNING.
+    Returns the list of IDs successfully claimed by this execution thread.
+    """
+    if not request_ids:
+        return []
+
+    placeholders = ",".join("%s" for _ in request_ids)
+
+    rows = connection.execute(
+        f"""
+        UPDATE maintenance_requests
+        SET planning_status = 'PLANNING'
+        WHERE id IN ({placeholders})
+          AND status = 'APPROVED'
+          AND planning_status = 'UNPLANNED'
+        RETURNING id
+        """,
+        request_ids,
+    ).fetchall()
+
+    return [row["id"] for row in rows]
+
+
 class OptimizationRequest(BaseModel):
     trains: list[TrainSchedule]
     maintenance_requests: list[MaintenanceRequest]
@@ -113,6 +161,12 @@ class RejectPlanRequest(BaseModel):
 
 class ModifyPlanRequest(BaseModel):
     changes: dict = Field(default_factory=dict)
+
+
+class ApprovePlanRequest(BaseModel):
+    result: OptimizationResult
+    changes: dict = Field(default_factory=dict)
+    source_plan_id: str | None = None
 
 
 class CreateDisruptionRequest(BaseModel):
@@ -241,28 +295,9 @@ def get_maintenance_requests():
     try:
         rows = connection.execute(
             """
-            SELECT
-                mr.*,
-                CASE
-                    WHEN EXISTS (
-                        SELECT 1
-                        FROM scheduled_tasks st
-                        WHERE st.request_id = mr.id
-                    )
-                    THEN 'PLANNED'
-                    ELSE 'UNPLANNED'
-                END AS planning_status,
-                (
-                    SELECT mb.plan_id
-                    FROM scheduled_tasks st
-                    JOIN maintenance_blocks mb
-                        ON st.block_id = mb.block_id
-                    WHERE st.request_id = mr.id
-                    ORDER BY mb.plan_id DESC
-                    LIMIT 1
-                ) AS plan_id
+            SELECT mr.*
             FROM maintenance_requests mr
-            ORDER BY mr.rowid DESC
+            ORDER BY mr.id DESC
             """
         ).fetchall()
         return [dict(row) for row in rows]
@@ -292,7 +327,7 @@ def create_maintenance_request(request: MaintenanceRequest):
                 status,
                 planning_status
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', 'UNPLANNED')
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'PENDING', 'UNPLANNED')
             """,
             (
                 request.id,
@@ -306,7 +341,7 @@ def create_maintenance_request(request: MaintenanceRequest):
                 request.predicted_duration_min,
                 request.crew_size,
                 request.priority,
-                1 if request.is_night else 0,
+                bool(request.is_night),
             ),
         )
         conn.commit()
@@ -326,7 +361,7 @@ def approve_maintenance_request(request_id: str):
     connection = get_connection()
     try:
         request = connection.execute(
-            "SELECT id, status FROM maintenance_requests WHERE id = ?",
+            "SELECT id, status FROM maintenance_requests WHERE id = %s",
             (request_id,),
         ).fetchone()
 
@@ -343,7 +378,7 @@ def approve_maintenance_request(request_id: str):
             UPDATE maintenance_requests
             SET status = 'APPROVED',
                 rejection_reason = NULL
-            WHERE id = ?
+            WHERE id = %s
             """,
             (request_id,),
         )
@@ -367,7 +402,7 @@ def reject_maintenance_request(request_id: str, rejection: RejectMaintenanceRequ
     connection = get_connection()
     try:
         request = connection.execute(
-            "SELECT id, status FROM maintenance_requests WHERE id = ?",
+            "SELECT id, status FROM maintenance_requests WHERE id = %s",
             (request_id,),
         ).fetchone()
 
@@ -383,8 +418,8 @@ def reject_maintenance_request(request_id: str, rejection: RejectMaintenanceRequ
             """
             UPDATE maintenance_requests
             SET status = 'REJECTED',
-                rejection_reason = ?
-            WHERE id = ?
+                rejection_reason = %s
+            WHERE id = %s
             """,
             (rejection.reason, request_id),
         )
@@ -409,7 +444,7 @@ def modify_maintenance_request(request_id: str, changes: ModifyMaintenanceReques
     connection = get_connection()
     try:
         existing = connection.execute(
-            "SELECT * FROM maintenance_requests WHERE id = ?",
+            "SELECT * FROM maintenance_requests WHERE id = %s",
             (request_id,),
         ).fetchone()
 
@@ -466,18 +501,18 @@ def modify_maintenance_request(request_id: str, changes: ModifyMaintenanceReques
                 detail="crew_size must be at least 1",
             )
 
-        set_clause = ", ".join(f"{field} = ?" for field in update_data)
+        set_clause = ", ".join(f"{field} = %s" for field in update_data)
         values = list(update_data.values())
         values.append(request_id)
 
         connection.execute(
-            f"UPDATE maintenance_requests SET {set_clause} WHERE id = ?",
+            f"UPDATE maintenance_requests SET {set_clause} WHERE id = %s",
             values,
         )
         connection.commit()
 
         updated = connection.execute(
-            "SELECT * FROM maintenance_requests WHERE id = ?",
+            "SELECT * FROM maintenance_requests WHERE id = %s",
             (request_id,),
         ).fetchone()
 
@@ -523,10 +558,10 @@ def get_block_requests(
                     ) THEN 'Planned'
                     WHEN mr.status = 'APPROVED' THEN 'Approved'
                     ELSE 'Pending Review'
-                END AS planning_status
+                END AS frontend_status
             FROM maintenance_requests mr
             LEFT JOIN sections s ON mr.section_id = s.id
-            ORDER BY mr.rowid DESC
+            ORDER BY mr.id DESC
             """
         ).fetchall()
 
@@ -545,20 +580,12 @@ def get_block_requests(
             )
 
             task_rows = connection.execute(
-                "SELECT id FROM scheduled_tasks WHERE request_id = ?",
+                "SELECT id FROM scheduled_tasks WHERE request_id = %s",
                 (r["id"],),
             ).fetchall()
             task_ids = [str(t["id"]) for t in task_rows] or [r["id"]]
 
-            frontend_status = r["planning_status"]
-            if r["status"] == "APPROVED" and not task_rows:
-                frontend_status = "Approved"
-            elif r["status"] == "PENDING":
-                frontend_status = "Pending Review"
-            elif r["status"] == "REJECTED":
-                frontend_status = "Rejected"
-            elif task_rows:
-                frontend_status = "Planned"
+            frontend_status = r["frontend_status"]
 
             start_dt = datetime.datetime.fromisoformat(f"{now_date}T00:00:00") + datetime.timedelta(minutes=r["window_start_min"])
 
@@ -643,7 +670,7 @@ def get_tasks(
                     ELSE 'Pending'
                 END AS computed_status
             FROM maintenance_requests mr
-            ORDER BY mr.rowid DESC
+            ORDER BY mr.id DESC
             """
         ).fetchall()
 
@@ -781,13 +808,23 @@ def optimize(request: OptimizationRequest):
         if not request_ids:
             raise HTTPException(status_code=400, detail="No maintenance requests supplied.")
 
-        placeholders = ",".join("?" for _ in request_ids)
+        placeholders = ",".join("%s" for _ in request_ids)
         rows = connection.execute(
-            f"SELECT id, status FROM maintenance_requests WHERE id IN ({placeholders})",
+            f"""
+            SELECT id, status, planning_status
+            FROM maintenance_requests
+            WHERE id IN ({placeholders})
+            """,
             request_ids,
         ).fetchall()
 
-        status_by_id = {row["id"]: row["status"] for row in rows}
+        status_by_id = {
+            row["id"]: {
+                "status": row["status"],
+                "planning_status": row["planning_status"],
+            }
+            for row in rows
+        }
 
         missing_ids = [r_id for r_id in request_ids if r_id not in status_by_id]
         if missing_ids:
@@ -796,64 +833,113 @@ def optimize(request: OptimizationRequest):
                 detail={"message": "Maintenance request(s) not found.", "request_ids": missing_ids},
             )
 
-        non_approved = [
-            {"id": r_id, "status": status_by_id[r_id]}
+        invalid_requests = [
+            {
+                "id": r_id,
+                "status": status_by_id[r_id]["status"],
+                "planning_status": status_by_id[r_id]["planning_status"],
+            }
             for r_id in request_ids
-            if status_by_id[r_id] != "APPROVED"
+            if (
+                status_by_id[r_id]["status"] != "APPROVED"
+                or status_by_id[r_id]["planning_status"] != "UNPLANNED"
+            )
         ]
-        if non_approved:
+
+        if invalid_requests:
             raise HTTPException(
                 status_code=400,
-                detail={"message": "Only APPROVED maintenance requests can be optimized.", "requests": non_approved},
+                detail={
+                    "message": "Only APPROVED and UNPLANNED maintenance requests can be optimized.",
+                    "requests": invalid_requests,
+                },
             )
 
-        ml_requests = apply_ml_predictions(
-            requests=request.maintenance_requests,
-            sections=request.sections,
-        )
-
-        result = solve_block_schedule(
-            requests=ml_requests,
-            trains=request.trains,
-            sections=request.sections,
-            disruptions=request.disruptions,
-            objective_type=request.objective_type,
-        )
-
-        for ml_request in ml_requests:
-            connection.execute(
-                """
-                UPDATE maintenance_requests
-                SET predicted_duration_min = ?,
-                    prediction_confidence = ?
-                WHERE id = ?
-                """,
-                (
-                    ml_request.predicted_duration_min,
-                    ml_request.prediction_confidence,
-                    ml_request.id,
-                ),
-            )
-
+        # ATOMICALLY CLAIM REQUESTS
+        claimed_ids = claim_maintenance_requests(connection, request_ids)
         connection.commit()
 
-        save_optimization_result(connection, result)
+        if len(claimed_ids) != len(request_ids):
+            if claimed_ids:
+                connection.execute(
+                    """
+                    UPDATE maintenance_requests
+                    SET planning_status = 'UNPLANNED',
+                        plan_id = NULL
+                    WHERE id = ANY(%s)
+                      AND planning_status = 'PLANNING'
+                    """,
+                    (claimed_ids,),
+                )
+                connection.commit()
 
-        final_plan_id = result.plan.plan_id
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "message": (
+                        "One or more maintenance requests are already "
+                        "being planned by another user."
+                    ),
+                    "request_ids": request_ids,
+                },
+            )
 
-        for block in result.blocks:
-                block_number = block.block_id.split("_B")[-1]
-                block.plan_id = final_plan_id
-                block.block_id = f"{final_plan_id}_B{block_number}"
+        try:
+            ml_requests = apply_ml_predictions(
+                requests=request.maintenance_requests,
+                sections=request.sections,
+            )
 
-        for task in result.scheduled_tasks:
-                task_block_number = task.block_id.split("_B")[-1]
-                task.block_id = f"{final_plan_id}_B{task_block_number}"
+            plan_id = generate_plan_id()
 
-        for explanation in result.explanations:
-                explanation.plan_id = final_plan_id
+            result = solve_block_schedule(
+                requests=ml_requests,
+                trains=request.trains,
+                sections=request.sections,
+                disruptions=request.disruptions,
+                objective_type=request.objective_type,
+                plan_id=plan_id,
+            )
 
-        return result
+            for ml_request in ml_requests:
+                connection.execute(
+                    """
+                    UPDATE maintenance_requests
+                    SET predicted_duration_min = %s,
+                        prediction_confidence = %s
+                    WHERE id = %s
+                    """,
+                    (
+                        ml_request.predicted_duration_min,
+                        ml_request.prediction_confidence,
+                        ml_request.id,
+                    ),
+                )
+
+            connection.commit()
+
+            save_optimization_result(
+                connection,
+                result,
+                plan_id=plan_id,
+            )
+
+            return result
+
+        except Exception:
+            if claimed_ids:
+                connection.execute(
+                    """
+                    UPDATE maintenance_requests
+                    SET planning_status = 'UNPLANNED',
+                        plan_id = NULL
+                    WHERE id = ANY(%s)
+                      AND planning_status = 'PLANNING'
+                    """,
+                    (claimed_ids,),
+                )
+                connection.commit()
+            raise
 
     except HTTPException:
         raise
@@ -871,7 +957,7 @@ def optimize_from_database(payload: DatabaseOptimizationRequest = DatabaseOptimi
         train_rows = connection.execute("SELECT * FROM train_schedules").fetchall()
 
         if payload.request_ids:
-            placeholders = ",".join("?" for _ in payload.request_ids)
+            placeholders = ",".join("%s" for _ in payload.request_ids)
             request_rows = connection.execute(
                 f"""
                 SELECT *
@@ -882,6 +968,25 @@ def optimize_from_database(payload: DatabaseOptimizationRequest = DatabaseOptimi
                 """,
                 payload.request_ids,
             ).fetchall()
+
+            found_ids = {row["id"] for row in request_rows}
+            missing_ids = [
+                request_id
+                for request_id in payload.request_ids
+                if request_id not in found_ids
+            ]
+
+            if missing_ids:
+                raise HTTPException(
+                    status_code=400,
+                    detail={
+                        "message": (
+                            "Some selected maintenance requests are not "
+                            "APPROVED and UNPLANNED."
+                        ),
+                        "request_ids": missing_ids,
+                    },
+                )
         else:
             request_rows = connection.execute(
                 """
@@ -892,48 +997,66 @@ def optimize_from_database(payload: DatabaseOptimizationRequest = DatabaseOptimi
                 """
             ).fetchall()
 
-        section_rows = connection.execute("SELECT * FROM sections").fetchall()
-        disruption_rows = connection.execute("SELECT * FROM disruptions").fetchall()
-
-        trains = [TrainSchedule(**dict(row)) for row in train_rows]
-        maintenance_requests = [MaintenanceRequest(**dict(row)) for row in request_rows]
-        sections = [Section(**dict(row)) for row in section_rows]
-        disruptions = [Disruption(**dict(row)) for row in disruption_rows]
-
-        ml_requests = apply_ml_predictions(
-            requests=maintenance_requests,
-            sections=sections,
-        )
-
-        for ml_request in ml_requests:
-            connection.execute(
-                """
-                UPDATE maintenance_requests
-                SET predicted_duration_min = ?,
-                    prediction_confidence = ?
-                WHERE id = ?
-                """,
-                (
-                    ml_request.predicted_duration_min,
-                    ml_request.prediction_confidence,
-                    ml_request.id,
-                ),
+        if not request_rows:
+            raise HTTPException(
+                status_code=400,
+                detail="No approved and unplanned maintenance requests are available for optimization.",
             )
 
-        connection.commit()
+        try:
+            section_rows = connection.execute("SELECT * FROM sections").fetchall()
+            disruption_rows = connection.execute("SELECT * FROM disruptions").fetchall()
 
-        plans = generate_fallback_plans_from_ml(
-            ml_requests=ml_requests,
-            trains=trains,
-            sections=sections,
-            disruptions=disruptions,
-            emergency_inserts=[],
-            parallel=False,
-            sort_by_rank=False,
-        )
+            trains = [TrainSchedule(**dict(row)) for row in train_rows]
+            maintenance_requests = [
+                MaintenanceRequest(**dict(row)) for row in request_rows
+            ]
+            sections = [Section(**dict(row)) for row in section_rows]
+            disruptions = [Disruption(**dict(row)) for row in disruption_rows]
 
-        return plans
+            ml_requests = apply_ml_predictions(
+                requests=maintenance_requests,
+                sections=sections,
+            )
 
+            for ml_request in ml_requests:
+                connection.execute(
+                    """
+                    UPDATE maintenance_requests
+                    SET predicted_duration_min = %s,
+                        prediction_confidence = %s
+                    WHERE id = %s
+                    """,
+                    (
+                        ml_request.predicted_duration_min,
+                        ml_request.prediction_confidence,
+                        ml_request.id,
+                    ),
+                )
+
+            connection.commit()
+
+            plans = generate_fallback_plans_from_ml(
+                ml_requests=ml_requests,
+                trains=trains,
+                sections=sections,
+                disruptions=disruptions,
+                emergency_inserts=[],
+                parallel=False,
+                sort_by_rank=False,
+            )
+
+            return plans
+
+        except Exception:
+            connection.rollback()
+            raise
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        connection.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
     finally:
         connection.close()
 
@@ -959,7 +1082,7 @@ def get_plan(plan_id: str):
     connection = get_connection()
     try:
         plan = connection.execute(
-            "SELECT * FROM block_plans WHERE plan_id = ?",
+            "SELECT * FROM block_plans WHERE plan_id = %s",
             (plan_id,),
         ).fetchone()
 
@@ -967,7 +1090,7 @@ def get_plan(plan_id: str):
             raise HTTPException(status_code=404, detail="Plan not found")
 
         blocks = connection.execute(
-            "SELECT * FROM maintenance_blocks WHERE plan_id = ? ORDER BY block_start_min",
+            "SELECT * FROM maintenance_blocks WHERE plan_id = %s ORDER BY block_start_min",
             (plan_id,),
         ).fetchall()
 
@@ -976,14 +1099,14 @@ def get_plan(plan_id: str):
             SELECT st.*
             FROM scheduled_tasks st
             JOIN maintenance_blocks mb ON st.block_id = mb.block_id
-            WHERE mb.plan_id = ?
+            WHERE mb.plan_id = %s
             ORDER BY st.scheduled_start_min
             """,
             (plan_id,),
         ).fetchall()
 
         explanations = connection.execute(
-            "SELECT * FROM plan_explanations WHERE plan_id = ? ORDER BY id",
+            "SELECT * FROM plan_explanations WHERE plan_id = %s ORDER BY id",
             (plan_id,),
         ).fetchall()
 
@@ -1002,7 +1125,7 @@ def get_plan_dashboard(plan_id: str):
     connection = get_connection()
     try:
         plan = connection.execute(
-            "SELECT * FROM block_plans WHERE plan_id = ?",
+            "SELECT * FROM block_plans WHERE plan_id = %s",
             (plan_id,),
         ).fetchone()
 
@@ -1010,7 +1133,7 @@ def get_plan_dashboard(plan_id: str):
             raise HTTPException(status_code=404, detail="Plan not found")
 
         blocks = connection.execute(
-            "SELECT * FROM maintenance_blocks WHERE plan_id = ? ORDER BY block_start_min",
+            "SELECT * FROM maintenance_blocks WHERE plan_id = %s ORDER BY block_start_min",
             (plan_id,),
         ).fetchall()
 
@@ -1019,14 +1142,14 @@ def get_plan_dashboard(plan_id: str):
             SELECT st.*
             FROM scheduled_tasks st
             JOIN maintenance_blocks mb ON st.block_id = mb.block_id
-            WHERE mb.plan_id = ?
+            WHERE mb.plan_id = %s
             ORDER BY st.scheduled_start_min
             """,
             (plan_id,),
         ).fetchall()
 
         explanations = connection.execute(
-            "SELECT * FROM plan_explanations WHERE plan_id = ? ORDER BY id",
+            "SELECT * FROM plan_explanations WHERE plan_id = %s ORDER BY id",
             (plan_id,),
         ).fetchall()
 
@@ -1060,7 +1183,7 @@ def _apply_plan_status_transition(connection, plan_id: str, new_status: str):
     additional related updates (e.g. maintenance_requests) succeed.
     """
     plan = connection.execute(
-        "SELECT * FROM block_plans WHERE plan_id = ?",
+        "SELECT * FROM block_plans WHERE plan_id = %s",
         (plan_id,),
     ).fetchone()
 
@@ -1079,7 +1202,7 @@ def _apply_plan_status_transition(connection, plan_id: str, new_status: str):
         )
 
     connection.execute(
-        "UPDATE block_plans SET status = ? WHERE plan_id = ?",
+        "UPDATE block_plans SET status = %s WHERE plan_id = %s",
         (new_status, plan_id),
     )
 
@@ -1096,14 +1219,15 @@ def approve_plan(plan_id: str):
             """
             UPDATE maintenance_requests
             SET planning_status = 'PLANNED',
-            status = 'APPROVED',
-                plan_id = ?
+                status = 'APPROVED',
+                plan_id = %s
             WHERE id IN (
                 SELECT st.request_id
                 FROM scheduled_tasks st
                 JOIN maintenance_blocks mb ON st.block_id = mb.block_id
-                WHERE mb.plan_id = ?
+                WHERE mb.plan_id = %s
             )
+            AND planning_status = 'PLANNING'
             """,
             (plan_id, plan_id),
         )
@@ -1111,7 +1235,7 @@ def approve_plan(plan_id: str):
         connection.commit()
 
         updated_plan = connection.execute(
-            "SELECT * FROM block_plans WHERE plan_id = ?",
+            "SELECT * FROM block_plans WHERE plan_id = %s",
             (plan_id,),
         ).fetchone()
 
@@ -1122,42 +1246,117 @@ def approve_plan(plan_id: str):
     finally:
         connection.close()
 
+
 @app.post("/plans/approve")
-def approve_selected_plan(result: OptimizationResult):
+def approve_selected_plan(payload: ApprovePlanRequest):
     connection = get_connection()
 
     try:
-        # Save ONLY the selected candidate
+        result = payload.result
+        changes = payload.changes
+
+        plan_id = generate_plan_id()
+
+        assign_plan_id(
+            result,
+            plan_id,
+        )
+
         save_optimization_result(
             connection,
             result,
+            plan_id=plan_id,
         )
 
-        # save_optimization_result() assigns the real database ID
         plan_id = result.plan.plan_id
 
-        # Approve the saved plan (freshly inserted rows are always
-        # PENDING_REVIEW, but the same guard is applied here for
-        # consistency with the other approve/reject paths).
         _apply_plan_status_transition(connection, plan_id, "APPROVED")
 
-        # Mark only requests belonging to this selected plan as planned
+        if changes:
+            allowed_fields = {
+                "department",
+                "section_id",
+                "asset_id",
+                "asset_type",
+                "window_start_min",
+                "window_end_min",
+                "base_duration_min",
+                "crew_size",
+                "priority",
+                "is_night",
+            }
+
+            for request_id, request_changes in changes.items():
+                if not isinstance(request_changes, dict):
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Changes for {request_id} must be an object.",
+                    )
+
+                unknown_fields = (
+                    set(request_changes.keys()) - allowed_fields
+                )
+
+                if unknown_fields:
+                    raise HTTPException(
+                        status_code=400,
+                        detail={
+                            "message": f"Unsupported fields for {request_id}.",
+                            "unsupported_fields": sorted(unknown_fields),
+                            "allowed_fields": sorted(allowed_fields),
+                        },
+                    )
+
+                if not request_changes:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"No changes provided for {request_id}.",
+                    )
+
+                set_clause = ", ".join(
+                    f"{field} = %s"
+                    for field in request_changes.keys()
+                )
+
+                values = list(request_changes.values())
+                values.append(request_id)
+
+                connection.execute(
+                    f"""
+                    UPDATE maintenance_requests
+                    SET {set_clause}
+                    WHERE id = %s
+                    """,
+                    values,
+                )
+
         connection.execute(
             """
             UPDATE maintenance_requests
             SET planning_status = 'PLANNED',
-            status = 'APPROVED',
-                plan_id = ?
+                status = 'APPROVED',
+                plan_id = %s
             WHERE id IN (
                 SELECT st.request_id
                 FROM scheduled_tasks st
                 JOIN maintenance_blocks mb
                     ON st.block_id = mb.block_id
-                WHERE mb.plan_id = ?
+                WHERE mb.plan_id = %s
             )
             """,
             (plan_id, plan_id),
         )
+
+        if payload.source_plan_id:
+            connection.execute(
+                """
+                UPDATE block_plans
+                SET status = 'SUPERSEDED'
+                WHERE plan_id = %s
+                AND status = 'APPROVED'
+                """,
+                (payload.source_plan_id,),
+            )
 
         connection.commit()
 
@@ -1165,7 +1364,7 @@ def approve_selected_plan(result: OptimizationResult):
             """
             SELECT *
             FROM block_plans
-            WHERE plan_id = ?
+            WHERE plan_id = %s
             """,
             (plan_id,),
         ).fetchone()
@@ -1173,20 +1372,51 @@ def approve_selected_plan(result: OptimizationResult):
         return {
             "message": "Selected plan approved successfully.",
             "plan": dict(updated_plan),
+            "applied_maintenance_changes": changes,
         }
+
+    except HTTPException:
+        connection.rollback()
+        raise
+
+    except Exception as e:
+        connection.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail=f"Plan approval failed: {str(e)}",
+        )
 
     finally:
         connection.close()
+
 
 @app.post("/plans/{plan_id}/reject")
 def reject_plan(plan_id: str, payload: RejectPlanRequest = RejectPlanRequest()):
     connection = get_connection()
     try:
         _apply_plan_status_transition(connection, plan_id, "REJECTED")
+
+        connection.execute(
+            """
+            UPDATE maintenance_requests
+            SET planning_status = 'UNPLANNED',
+                plan_id = NULL
+            WHERE id IN (
+                SELECT st.request_id
+                FROM scheduled_tasks st
+                JOIN maintenance_blocks mb
+                    ON st.block_id = mb.block_id
+                WHERE mb.plan_id = %s
+            )
+            AND planning_status = 'PLANNING'
+            """,
+            (plan_id,),
+        )
+
         connection.commit()
 
         updated_plan = connection.execute(
-            "SELECT * FROM block_plans WHERE plan_id = ?",
+            "SELECT * FROM block_plans WHERE plan_id = %s",
             (plan_id,),
         ).fetchone()
 
@@ -1194,71 +1424,370 @@ def reject_plan(plan_id: str, payload: RejectPlanRequest = RejectPlanRequest()):
             "message": f"Plan {plan_id} rejected: {payload.reason}",
             "plan": dict(updated_plan),
         }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        connection.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
     finally:
         connection.close()
 
 
 @app.post("/plans/{plan_id}/modify")
-def modify_plan(plan_id: str, payload: ModifyPlanRequest = ModifyPlanRequest()):
+def modify_plan(
+    plan_id: str,
+    payload: ModifyPlanRequest = ModifyPlanRequest(),
+):
     connection = get_connection()
+
     try:
         plan = connection.execute(
-            "SELECT * FROM block_plans WHERE plan_id = ?",
+            """
+            SELECT *
+            FROM block_plans
+            WHERE plan_id = %s
+            """,
             (plan_id,),
         ).fetchone()
 
         if plan is None:
             raise HTTPException(status_code=404, detail="Plan not found")
 
-        return {
-            "message": f"Plan {plan_id} updated.",
-            "plan_id": plan_id,
-            "status": "DRAFT",
-            "changes": payload.changes,
+        if plan["status"] == "REJECTED":
+            raise HTTPException(
+                status_code=409,
+                detail="Rejected plans cannot be modified.",
+            )
+
+        if not payload.changes:
+            raise HTTPException(
+                status_code=400,
+                detail="No changes were provided.",
+            )
+
+        request_ids = list(payload.changes.keys())
+        placeholders = ", ".join(["%s"] * len(request_ids))
+
+        request_rows = connection.execute(
+            f"""
+            SELECT *
+            FROM maintenance_requests
+            WHERE id IN ({placeholders})
+            """,
+            tuple(request_ids),
+        ).fetchall()
+
+        found_ids = {str(row["id"]) for row in request_rows}
+        missing_ids = [
+            request_id
+            for request_id in request_ids
+            if request_id not in found_ids
+        ]
+
+        if missing_ids:
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "message": "One or more maintenance requests were not found.",
+                    "missing_request_ids": missing_ids,
+                },
+            )
+
+        plan_request_rows = connection.execute(
+            """
+            SELECT DISTINCT st.request_id
+            FROM scheduled_tasks st
+            JOIN maintenance_blocks mb
+                ON st.block_id = mb.block_id
+            WHERE mb.plan_id = %s
+            """,
+            (plan_id,),
+        ).fetchall()
+
+        plan_request_ids = {
+            str(row["request_id"])
+            for row in plan_request_rows
         }
+
+        invalid_plan_requests = [
+            request_id
+            for request_id in request_ids
+            if request_id not in plan_request_ids
+        ]
+
+        if invalid_plan_requests:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "message": "Some maintenance requests do not belong to this plan.",
+                    "invalid_request_ids": invalid_plan_requests,
+                },
+            )
+
+        allowed_fields = {
+            "department",
+            "section_id",
+            "asset_id",
+            "asset_type",
+            "window_start_min",
+            "window_end_min",
+            "base_duration_min",
+            "crew_size",
+            "priority",
+            "is_night",
+        }
+
+        normalized_changes = {}
+
+        for request_id, changes in payload.changes.items():
+            if not isinstance(changes, dict):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Changes for {request_id} must be an object.",
+                )
+
+            if not changes:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"No changes provided for {request_id}.",
+                )
+
+            unknown_fields = set(changes.keys()) - allowed_fields
+            if unknown_fields:
+                raise HTTPException(
+                    status_code=400,
+                    detail={
+                        "message": f"Unsupported fields for {request_id}.",
+                        "unsupported_fields": sorted(unknown_fields),
+                        "allowed_fields": sorted(allowed_fields),
+                    },
+                )
+
+            current_row = next(
+                row
+                for row in request_rows
+                if str(row["id"]) == request_id
+            )
+
+            current_data = dict(current_row)
+            current_data.pop("status", None)
+            current_data.pop("planning_status", None)
+            current_data.pop("plan_id", None)
+            current_data.pop("created_at", None)
+            current_data.pop("updated_at", None)
+
+            updated_data = current_data.copy()
+            updated_data.update(changes)
+
+            try:
+                validated_request = MaintenanceRequest(**updated_data)
+            except Exception as e:
+                raise HTTPException(
+                    status_code=400,
+                    detail={
+                        "message": f"Invalid changes for {request_id}.",
+                        "error": str(e),
+                    },
+                )
+
+            normalized_changes[request_id] = {
+                field: getattr(validated_request, field)
+                for field in changes.keys()
+            }
+
+        return {
+            "message": "Changes validated successfully.",
+            "plan_id": plan_id,
+            "source_plan_status": plan["status"],
+            "changes": normalized_changes,
+            "next_step": f"POST /plans/{plan_id}/reoptimize",
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=str(e),
+        )
     finally:
         connection.close()
 
 
 @app.post("/plans/{plan_id}/reoptimize")
-def reoptimize_plan(plan_id: str):
+def reoptimize_plan(
+    plan_id: str,
+    payload: ModifyPlanRequest = ModifyPlanRequest(),
+):
     connection = get_connection()
+
     try:
+        plan = connection.execute(
+            """
+            SELECT *
+            FROM block_plans
+            WHERE plan_id = %s
+            """,
+            (plan_id,),
+        ).fetchone()
+
+        if plan is None:
+            raise HTTPException(
+                status_code=404,
+                detail="Plan not found",
+            )
+
+        if plan["status"] == "REJECTED":
+            raise HTTPException(
+                status_code=409,
+                detail="Rejected plans cannot be re-optimized.",
+            )
+
         req_rows = connection.execute(
             """
-            SELECT mr.*
+            SELECT DISTINCT mr.*
             FROM maintenance_requests mr
-            JOIN scheduled_tasks st ON mr.id = st.request_id
-            JOIN maintenance_blocks mb ON st.block_id = mb.block_id
-            WHERE mb.plan_id = ?
+            JOIN scheduled_tasks st
+                ON mr.id = st.request_id
+            JOIN maintenance_blocks mb
+                ON st.block_id = mb.block_id
+            WHERE mb.plan_id = %s
             """,
             (plan_id,),
         ).fetchall()
 
         if not req_rows:
-            req_rows = connection.execute(
-                "SELECT * FROM maintenance_requests WHERE status = 'APPROVED'"
-            ).fetchall()
+            raise HTTPException(
+                status_code=400,
+                detail="No maintenance requests are associated with this plan.",
+            )
+
+        requests = [
+            MaintenanceRequest(**dict(row))
+            for row in req_rows
+        ]
+
+        applied_changes = {}
+
+        if payload.changes:
+            allowed_fields = {
+                "department",
+                "section_id",
+                "asset_id",
+                "asset_type",
+                "window_start_min",
+                "window_end_min",
+                "base_duration_min",
+                "crew_size",
+                "priority",
+                "is_night",
+            }
+
+            request_map = {
+                str(request.id): request
+                for request in requests
+            }
+
+            for request_id, changes in payload.changes.items():
+                if request_id not in request_map:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            f"Maintenance request {request_id} "
+                            f"does not belong to plan {plan_id}."
+                        ),
+                    )
+
+                if not isinstance(changes, dict):
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Changes for {request_id} must be an object.",
+                    )
+
+                if not changes:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"No changes provided for {request_id}.",
+                    )
+
+                unknown_fields = set(changes.keys()) - allowed_fields
+                if unknown_fields:
+                    raise HTTPException(
+                        status_code=400,
+                        detail={
+                            "message": f"Unsupported fields for {request_id}.",
+                            "unsupported_fields": sorted(unknown_fields),
+                            "allowed_fields": sorted(allowed_fields),
+                        },
+                    )
+
+                current_request = request_map[request_id]
+                updated_data = current_request.model_dump()
+                updated_data.update(changes)
+
+                try:
+                    updated_request = MaintenanceRequest(**updated_data)
+                except Exception as e:
+                    raise HTTPException(
+                        status_code=400,
+                        detail={
+                            "message": f"Invalid changes for {request_id}.",
+                            "error": str(e),
+                        },
+                    )
+
+                request_map[request_id] = updated_request
+                applied_changes[request_id] = {
+                    field: getattr(updated_request, field)
+                    for field in changes.keys()
+                }
+
+            requests = [
+                request_map[str(request.id)]
+                for request in requests
+            ]
 
         train_rows = connection.execute("SELECT * FROM train_schedules").fetchall()
         section_rows = connection.execute("SELECT * FROM sections").fetchall()
         disruption_rows = connection.execute("SELECT * FROM disruptions").fetchall()
 
         trains = [TrainSchedule(**dict(row)) for row in train_rows]
-        requests = [MaintenanceRequest(**dict(row)) for row in req_rows]
         sections = [Section(**dict(row)) for row in section_rows]
         disruptions = [Disruption(**dict(row)) for row in disruption_rows]
 
-        result = solve_block_schedule(
+        ml_requests = apply_ml_predictions(
             requests=requests,
+            sections=sections,
+        )
+
+        plans = generate_fallback_plans_from_ml(
+            ml_requests=ml_requests,
             trains=trains,
             sections=sections,
             disruptions=disruptions,
-            plan_name=f"Re-optimized Plan from {plan_id}",
+            emergency_inserts=[],
+            parallel=False,
+            sort_by_rank=False,
         )
 
-        save_optimization_result(connection, result)
-        return result
+        return {
+            "message": f"Plan {plan_id} re-optimized successfully.",
+            "source_plan_id": plan_id,
+            "source_plan_status": plan["status"],
+            "status": "DRAFT",
+            "applied_changes": applied_changes,
+            "candidate_plans": plans,
+            "next_step": "Select one candidate and send its result to POST /plans/approve.",
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Re-optimization failed: {str(e)}",
+        )
     finally:
         connection.close()
 
@@ -1272,14 +1801,14 @@ def get_dashboard_summary(department: Optional[str] = None):
         req_query = "SELECT * FROM maintenance_requests"
         params = []
         if raw_dept:
-            req_query += " WHERE department = ?"
+            req_query += " WHERE department = %s"
             params.append(raw_dept)
 
         req_rows = connection.execute(req_query, params).fetchall()
         reqs = [dict(r) for r in req_rows]
 
-        plans_count = connection.execute("SELECT COUNT(*) FROM block_plans").fetchone()[0]
-        disruptions_count = connection.execute("SELECT COUNT(*) FROM disruptions").fetchone()[0]
+        plans_count = connection.execute("SELECT COUNT(*) AS count FROM block_plans").fetchone()["count"]
+        disruptions_count = connection.execute("SELECT COUNT(*) AS count FROM disruptions").fetchone()["count"]
 
         critical = len([r for r in reqs if r["priority"] == 1])
         pending = len([r for r in reqs if r["status"] == "PENDING"])
@@ -1405,9 +1934,9 @@ def get_data_quality_issues():
 def get_unified_dataset_summary():
     connection = get_connection()
     try:
-        sections_count = connection.execute("SELECT COUNT(*) FROM sections").fetchone()[0]
-        trains_count = connection.execute("SELECT COUNT(*) FROM train_schedules").fetchone()[0]
-        requests_count = connection.execute("SELECT COUNT(*) FROM maintenance_requests").fetchone()[0]
+        sections_count = connection.execute("SELECT COUNT(*) AS count FROM sections").fetchone()["count"]
+        trains_count = connection.execute("SELECT COUNT(*) AS count FROM train_schedules").fetchone()["count"]
+        requests_count = connection.execute("SELECT COUNT(*) AS count FROM maintenance_requests").fetchone()["count"]
 
         return {
             "totalEntities": sections_count + trains_count + requests_count,
@@ -1429,7 +1958,7 @@ def run_data_processing():
 def get_disruptions():
     connection = get_connection()
     try:
-        rows = connection.execute("SELECT * FROM disruptions ORDER BY rowid DESC").fetchall()
+        rows = connection.execute("SELECT * FROM disruptions ORDER BY id DESC").fetchall()
         return [dict(r) for r in rows]
     finally:
         connection.close()
@@ -1439,8 +1968,7 @@ def get_disruptions():
 def create_disruption(payload: CreateDisruptionRequest):
     connection = get_connection()
     try:
-        count = connection.execute("SELECT COUNT(*) FROM disruptions").fetchone()[0]
-        disruption_id = f"D{count + 1:03d}"
+        disruption_id = f"D_{uuid.uuid4().hex[:12].upper()}"
         dtype = payload.disruption_type or payload.type or "SECTION_BLOCKED"
 
         connection.execute(
@@ -1455,7 +1983,7 @@ def create_disruption(payload: CreateDisruptionRequest):
                 severity,
                 description
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
             """,
             (
                 disruption_id,
@@ -1471,7 +1999,7 @@ def create_disruption(payload: CreateDisruptionRequest):
         connection.commit()
 
         row = connection.execute(
-            "SELECT * FROM disruptions WHERE id = ?",
+            "SELECT * FROM disruptions WHERE id = %s",
             (disruption_id,),
         ).fetchone()
         return dict(row)
@@ -1484,11 +2012,27 @@ def run_simulation(scenario: SimulationRequest):
     connection = get_connection()
     try:
         req_rows = connection.execute(
-            "SELECT * FROM maintenance_requests WHERE status = 'APPROVED'"
+            """
+            SELECT *
+            FROM maintenance_requests
+            WHERE status = 'APPROVED'
+              AND planning_status = 'UNPLANNED'
+            """
         ).fetchall()
+        if not req_rows:
+            req_rows = connection.execute(
+                """
+                SELECT *
+                FROM maintenance_requests
+                WHERE status = 'APPROVED'
+                """
+            ).fetchall()
+        if not req_rows:
+            req_rows = connection.execute(
+                "SELECT * FROM maintenance_requests"
+            ).fetchall()
         train_rows = connection.execute("SELECT * FROM train_schedules ORDER BY entry_time_min ASC").fetchall()
         section_rows = connection.execute("SELECT * FROM sections").fetchall()
-        station_map = get_station_map(connection)
         section_map = get_section_map(connection)
 
         trains = [TrainSchedule(**dict(r)) for r in train_rows]
@@ -1591,8 +2135,6 @@ def run_simulation(scenario: SimulationRequest):
                 "is_shifted": shift != 0,
             })
 
-        save_optimization_result(connection, updated_result)
-
         delayed_trains_count = len([d for d in cascade_delays if d["total_delay_min"] > 0])
         total_delay_minutes = sum(d["total_delay_min"] for d in cascade_delays)
 
@@ -1658,7 +2200,7 @@ def get_alerts(department: Optional[str] = None):
     connection = get_connection()
     try:
         disruptions = connection.execute(
-            "SELECT * FROM disruptions ORDER BY rowid DESC"
+            "SELECT * FROM disruptions ORDER BY id DESC"
         ).fetchall()
 
         now_iso = datetime.datetime.now().isoformat()
@@ -1721,7 +2263,7 @@ def get_activities():
     return [
         {"id": "ACT-101", "type": "workflow", "text": "Database connected & verified with 7 railway sections and 11 trains", "timestamp": now_iso},
         {"id": "ACT-102", "type": "system", "text": "OR-Tools CP-SAT scheduler engine initialized", "timestamp": now_iso},
-        {"id": "ACT-103", "type": "workflow", "text": "Maintenance requests synced with SQLite database", "timestamp": now_iso},
+        {"id": "ACT-103", "type": "workflow", "text": "Maintenance requests synced with PostgreSQL database", "timestamp": now_iso},
     ]
 
 
@@ -1752,6 +2294,3 @@ def get_workflow_analytics():
         }
     finally:
         connection.close()
-
-
-
