@@ -239,6 +239,30 @@ const plannedApprovedRequests = approvedRequests.filter(
     }
   }
 
+  async function handleRejectPlan() {
+    if (!result?.plan?.plan_id) {
+      setErrorMessage('No plan is available to reject.')
+      return
+    }
+
+    try {
+      const res = await api.rejectPlan(result.plan.plan_id)
+
+      setResult((current) => ({
+        ...current,
+        plan: res.plan,
+      }))
+
+      setReviewStatus('rejected')
+    } catch (err) {
+      setErrorMessage(
+        err?.response?.data?.detail ||
+        err.message ||
+        'Plan rejection failed.'
+      )
+    }
+  }
+
   const blockColumns = [
     { key: 'block_id', header: 'block_id', render: (b) => <span className="font-mono text-xs">{b.block_id}</span> },
     {
@@ -496,7 +520,7 @@ const plannedApprovedRequests = approvedRequests.filter(
           <HumanApprovalBar
             reviewStatus={reviewStatus}
             onApprove={handleApprovePlan}
-            onReject={() => setReviewStatus('rejected')}
+            onReject={handleRejectPlan}
             onModify={() => {
               setLastMode('custom')
               document.getElementById('root')?.scrollIntoView({ behavior: 'smooth' })

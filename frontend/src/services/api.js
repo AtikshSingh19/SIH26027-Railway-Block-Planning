@@ -308,16 +308,6 @@ async function getPlanDashboard(planId) {
   return data
 }
 
-async function generatePlan(params) {
-  if (USE_MOCK) {
-    await delay(1200)
-    return buildMockOptimizationResult()
-  }
-  const { data } = await httpClient.post('/optimize/database', {
-    objective_type: params?.objective || 'BALANCED',
-  })
-  return data
-}
 
 async function reoptimizePlan(planId) {
   const { data } = await httpClient.post(`/plans/${planId}/reoptimize`)
@@ -398,7 +388,7 @@ const api = {
   getPlanDashboard,
   optimize,
   optimizeFromDatabase,
-  generatePlan,
+
   approvePlan,
   rejectPlan,
   modifyPlan,

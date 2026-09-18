@@ -91,28 +91,38 @@ export default function MaintenanceRecords() {
   const [newRequestModalOpen, setNewRequestModalOpen] = useState(false)
   const [myRequestsOpen, setMyRequestsOpen] = useState(false)
 
+  // "My Requests" reads live backend state (status, planning_status,
+  // plan_id) rather than only the local workflowStore copy.
+  const { data: backendMaintenanceRequests, refetch: refetchMaintenanceRequests } = useFetch(
+    () => api.getMaintenanceRequests(),
+    [],
+  )
+
   const myRequests = useMemo(() => {
-    const localRequests = workflow.getMyRequests(user?.name) || []
-    if (!blockRequests || !Array.isArray(blockRequests)) return localRequests
+    const requests = workflow.getMyRequests(user?.name)
+    const entries = Array.isArray(requests) ? requests : []
+    const liveById = new Map((backendMaintenanceRequests || []).map((r) => [r.id, r]))
 
-    const blockReqMap = new Map(blockRequests.map((r) => [r.id, r]))
+    return entries.map((entry) => {
+      const live = liveById.get(entry.id)
+      if (!live) return entry
 
-    return localRequests.map((entry) => {
-      const backendReq = blockReqMap.get(entry.id)
-      if (!backendReq) return entry
-      let effectiveStatus = backendReq.status
-      if (backendReq.planning_status === 'PLANNED' || backendReq.status === 'PLANNED') {
-        effectiveStatus = 'SCHEDULED'
-      } else if (backendReq.status === 'APPROVED') {
-        effectiveStatus = 'APPROVED'
-      }
+      // Backend is the source of truth for approval/planning state.
+      // A request that's APPROVED and already linked into an approved plan is shown as
+      // SCHEDULED.
+      const status =
+        live.status === 'APPROVED' && live.planning_status === 'PLANNED'
+          ? 'SCHEDULED'
+          : live.status
+
       return {
         ...entry,
-        status: effectiveStatus || entry.status,
-        request: backendReq.request || entry.request,
+        status,
+        rejectionReason: live.rejection_reason ?? entry.rejectionReason,
+        planId: live.plan_id ?? null,
       }
     })
-  }, [workflow, user?.name, blockRequests])
+  }, [workflow, user?.name, backendMaintenanceRequests])
 
   async function handleSubmitNewRequest(request, meta) {
     await api.createMaintenanceRequest(request, { ...meta, requestedBy: user?.name || 'Employee' })
@@ -120,13 +130,14 @@ export default function MaintenanceRecords() {
     setMyRequestsOpen(true)
     refetchTasks()
     refetchBlockRequests()
-    
+    refetchMaintenanceRequests()
   }
 
   function closeReviewAndRefresh() {
     setSelectedTask(null)
     refetchTasks()
     refetchBlockRequests()
+    refetchMaintenanceRequests()
   }
 
   async function handleApprove() {
@@ -220,7 +231,15 @@ export default function MaintenanceRecords() {
         }
         actions={
           <>
-            <Button variant="secondary" size="sm" icon={ListChecks} onClick={() => setMyRequestsOpen(true)}>
+            <Button
+              variant="secondary"
+              size="sm"
+              icon={ListChecks}
+              onClick={() => {
+                setMyRequestsOpen(true)
+                refetchMaintenanceRequests()
+              }}
+            >
               My Requests{myRequests.length > 0 ? ` (${myRequests.length})` : ''}
             </Button>
             <Button variant="ai" size="sm" icon={Plus} onClick={() => setNewRequestModalOpen(true)}>
@@ -318,7 +337,6 @@ export default function MaintenanceRecords() {
         onClose={() => setMyRequestsOpen(false)}
         title="My Requests"
         subtitle="Maintenance requests from the backend"
-
       >
         <MyRequestsPanel entries={myRequests} sectionsById={sectionsById} stationNameMap={stationNameMap} />
       </SidePanel>

@@ -2,8 +2,8 @@ import os
 import uuid
 
 import psycopg
-from psycopg.rows import dict_row
 from dotenv import load_dotenv
+from psycopg.rows import dict_row
 
 load_dotenv()
 
@@ -16,9 +16,7 @@ if not DATABASE_URL:
 
 
 def get_connection():
-    """
-    Create and return a PostgreSQL connection to Supabase.
-    """
+    """Create and return a PostgreSQL connection to Supabase."""
     return psycopg.connect(
         DATABASE_URL,
         row_factory=dict_row,
@@ -26,35 +24,28 @@ def get_connection():
 
 
 def initialize_database():
-    """
-    Verify that the Supabase PostgreSQL database is reachable.
-
-    The schema and seed data are managed in Supabase,
-    so the backend does not create or modify database tables.
-    """
+    """Verify that the Supabase PostgreSQL database is reachable."""
     with get_connection() as connection:
         connection.execute("SELECT 1")
 
 
 def save_optimization_result(connection, result, plan_id=None):
     plan = result.plan
+    blocks = getattr(result, "blocks", []) or []
+    scheduled_tasks = getattr(result, "scheduled_tasks", []) or []
+    explanations = getattr(result, "explanations", []) or []
 
-    # Use one atomic transaction for the complete optimization result.
     with connection.transaction():
-
-        # ---------------------------------------------------------
         # 1. Determine Plan ID
-        # ---------------------------------------------------------
-        if plan_id is None:
-            new_plan_id = f"PLAN_{uuid.uuid4().hex[:12].upper()}"
-        else:
-            new_plan_id = plan_id
+        new_plan_id = (
+            plan_id
+            if plan_id is not None
+            else f"PLAN_{uuid.uuid4().hex[:12].upper()}"
+        )
 
         plan.plan_id = new_plan_id
 
-        # ---------------------------------------------------------
         # 2. Insert Block Plan
-        # ---------------------------------------------------------
         connection.execute(
             """
             INSERT INTO block_plans (
@@ -79,11 +70,7 @@ def save_optimization_result(connection, result, plan_id=None):
                 getattr(plan, "plan_name", f"Plan {plan.plan_id}"),
                 plan.objective_type,
                 getattr(plan, "baseline_blocks_count", 0),
-                getattr(
-                    plan,
-                    "total_blocks_count",
-                    len(result.blocks),
-                ),
+                getattr(plan, "total_blocks_count", len(blocks)),
                 getattr(plan, "blocks_saved", 0),
                 plan.total_wait_time_min,
                 plan.total_train_delay_min,
@@ -92,10 +79,8 @@ def save_optimization_result(connection, result, plan_id=None):
             ),
         )
 
-        # ---------------------------------------------------------
         # 3. Insert Maintenance Blocks
-        # ---------------------------------------------------------
-        for block in result.blocks:
+        for block in blocks:
             connection.execute(
                 """
                 INSERT INTO maintenance_blocks (
@@ -116,11 +101,8 @@ def save_optimization_result(connection, result, plan_id=None):
                 ),
             )
 
-        # ---------------------------------------------------------
         # 4. Insert Scheduled Tasks
-        # ---------------------------------------------------------
-        for task in result.scheduled_tasks:
-
+        for task in scheduled_tasks:
             duration = getattr(task, "duration_min", None)
 
             if duration is None:
@@ -157,10 +139,8 @@ def save_optimization_result(connection, result, plan_id=None):
                 ),
             )
 
-        # ---------------------------------------------------------
         # 5. Insert Plan Explanations
-        # ---------------------------------------------------------
-        for explanation in result.explanations:
+        for explanation in explanations:
             connection.execute(
                 """
                 INSERT INTO plan_explanations (
@@ -174,3 +154,73 @@ def save_optimization_result(connection, result, plan_id=None):
                     explanation.explanation_text,
                 ),
             )
+
+
+def migrate_database():
+    """Apply small schema updates to the existing Supabase PostgreSQL database."""
+    connection = get_connection()
+
+    try:
+        connection.autocommit = True
+
+        # Check maintenance_requests columns
+        maintenance_columns = {
+            row["column_name"]
+            for row in connection.execute(
+                """
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_schema = 'public'
+                  AND table_name = 'maintenance_requests'
+                """
+            ).fetchall()
+        }
+
+        if "status" not in maintenance_columns:
+            connection.execute(
+                """
+                ALTER TABLE maintenance_requests
+                ADD COLUMN status VARCHAR(50)
+                """
+            )
+
+        if "rejection_reason" not in maintenance_columns:
+            connection.execute(
+                """
+                ALTER TABLE maintenance_requests
+                ADD COLUMN rejection_reason TEXT
+                """
+            )
+
+        if "prediction_confidence" not in maintenance_columns:
+            connection.execute(
+                """
+                ALTER TABLE maintenance_requests
+                ADD COLUMN prediction_confidence REAL
+                """
+            )
+
+        # Check block_plans columns
+        block_plan_columns = {
+            row["column_name"]
+            for row in connection.execute(
+                """
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_schema = 'public'
+                  AND table_name = 'block_plans'
+                """
+            ).fetchall()
+        }
+
+        if "total_window_shift_min" not in block_plan_columns:
+            connection.execute(
+                """
+                ALTER TABLE block_plans
+                ADD COLUMN total_window_shift_min REAL
+                NOT NULL DEFAULT 0.0
+                """
+            )
+
+    finally:
+        connection.close()

@@ -11,7 +11,7 @@ import Tag from '../components/common/Tag'
 import LinkedTasksCell from '../components/blockrequests/LinkedTasksCell'
 import RequestDetailContent from '../components/blockrequests/RequestDetailContent'
 import PlannerRequestReview from '../components/blockrequests/PlannerRequestReview'
-import { useWorkflow } from '../context/WorkflowContext'
+
 import { useFetch } from '../hooks/useFetch'
 import api from '../services/api'
 import { useRole } from '../context/RoleContext'
@@ -38,7 +38,7 @@ function formatPlanningTime(minutes) {
 
 export default function BlockRequests() {
   const { role, user } = useRole()
-  const workflow = useWorkflow()
+
 
   // Role-aware default: Engineering/S&T/Traction planners start scoped to
   // their own department; Control Office, Block/Operations and Admin see

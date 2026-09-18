@@ -2,8 +2,6 @@ import datetime
 import uuid
 from contextlib import asynccontextmanager
 from typing import Dict, List, Optional
-from ml_inference import apply_ml_predictions
-from replanner import generate_fallback_plans_from_ml
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -14,13 +12,15 @@ from database.connection import (
     initialize_database,
     save_optimization_result,
 )
-from logic import solve_block_schedule, OptimizationResult
+from logic import OptimizationResult, solve_block_schedule
+from ml_inference import apply_ml_predictions
 from models import (
     Disruption,
     MaintenanceRequest,
     Section,
     TrainSchedule,
 )
+from replanner import generate_fallback_plans_from_ml
 
 
 @asynccontextmanager
@@ -1170,39 +1170,56 @@ def get_plan_dashboard(plan_id: str):
         connection.close()
 
 
+def _apply_plan_status_transition(connection, plan_id: str, new_status: str):
+    """
+    Validate and apply a status transition on block_plans.
+
+    Only PENDING_REVIEW -> APPROVED and PENDING_REVIEW -> REJECTED are
+    allowed. APPROVED and REJECTED are terminal decisions: attempting to
+    move a plan out of either state is rejected with an HTTP 409 rather
+    than silently overwriting the existing human decision.
+
+    Does not commit; caller is responsible for committing once any
+    additional related updates (e.g. maintenance_requests) succeed.
+    """
+    plan = connection.execute(
+        "SELECT * FROM block_plans WHERE plan_id = %s",
+        (plan_id,),
+    ).fetchone()
+
+    if plan is None:
+        raise HTTPException(status_code=404, detail="Plan not found")
+
+    current_status = plan["status"]
+
+    if current_status != "PENDING_REVIEW":
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Plan {plan_id} is already {current_status} and cannot "
+                f"be changed to {new_status}."
+            ),
+        )
+
+    connection.execute(
+        "UPDATE block_plans SET status = %s WHERE plan_id = %s",
+        (new_status, plan_id),
+    )
+
+    return plan
+
+
 @app.post("/plans/{plan_id}/approve")
 def approve_plan(plan_id: str):
     connection = get_connection()
     try:
-        plan = connection.execute(
-            "SELECT * FROM block_plans WHERE plan_id = %s",
-            (plan_id,),
-        ).fetchone()
-
-        if plan is None:
-            raise HTTPException(status_code=404, detail="Plan not found")
-
-        if plan["status"] == "APPROVED":
-            raise HTTPException(
-                status_code=409,
-                detail="Plan is already approved.",
-            )
-
-        if plan["status"] == "REJECTED":
-            raise HTTPException(
-                status_code=409,
-                detail="Rejected plans cannot be approved.",
-            )
-
-        connection.execute(
-            "UPDATE block_plans SET status = 'APPROVED' WHERE plan_id = %s",
-            (plan_id,),
-        )
+        _apply_plan_status_transition(connection, plan_id, "APPROVED")
 
         connection.execute(
             """
             UPDATE maintenance_requests
             SET planning_status = 'PLANNED',
+                status = 'APPROVED',
                 plan_id = %s
             WHERE id IN (
                 SELECT st.request_id
@@ -1251,20 +1268,11 @@ def approve_selected_plan(payload: ApprovePlanRequest):
             plan_id=plan_id,
         )
 
-        # Approve the newly saved plan
-        connection.execute(
-            """
-            UPDATE block_plans
-            SET status = 'APPROVED'
-            WHERE plan_id = %s
-            """,
-            (plan_id,),
-        )
+        plan_id = result.plan.plan_id
 
-        # Apply maintenance-request changes only when
-        # this candidate came from a modified/re-optimized plan
+        _apply_plan_status_transition(connection, plan_id, "APPROVED")
+
         if changes:
-
             allowed_fields = {
                 "department",
                 "section_id",
@@ -1279,7 +1287,6 @@ def approve_selected_plan(payload: ApprovePlanRequest):
             }
 
             for request_id, request_changes in changes.items():
-
                 if not isinstance(request_changes, dict):
                     raise HTTPException(
                         status_code=400,
@@ -1323,12 +1330,11 @@ def approve_selected_plan(payload: ApprovePlanRequest):
                     values,
                 )
 
-        # Mark requests belonging to the selected plan as approved and planned
         connection.execute(
             """
             UPDATE maintenance_requests
-            SET status = 'APPROVED',
-                planning_status = 'PLANNED',
+            SET planning_status = 'PLANNED',
+                status = 'APPROVED',
                 plan_id = %s
             WHERE id IN (
                 SELECT st.request_id
@@ -1350,7 +1356,7 @@ def approve_selected_plan(payload: ApprovePlanRequest):
                 AND status = 'APPROVED'
                 """,
                 (payload.source_plan_id,),
-    )
+            )
 
         connection.commit()
 
@@ -1388,34 +1394,7 @@ def approve_selected_plan(payload: ApprovePlanRequest):
 def reject_plan(plan_id: str, payload: RejectPlanRequest = RejectPlanRequest()):
     connection = get_connection()
     try:
-        plan = connection.execute(
-            "SELECT * FROM block_plans WHERE plan_id = %s",
-            (plan_id,),
-        ).fetchone()
-
-        if plan is None:
-            raise HTTPException(status_code=404, detail="Plan not found")
-
-        if plan["status"] == "REJECTED":
-            raise HTTPException(
-                status_code=409,
-                detail="Plan is already rejected.",
-            )
-
-        if plan["status"] == "APPROVED":
-            raise HTTPException(
-                status_code=409,
-                detail="Approved plans cannot be rejected.",
-            )
-
-        connection.execute(
-            """
-            UPDATE block_plans
-            SET status = 'REJECTED'
-            WHERE plan_id = %s
-            """,
-            (plan_id,),
-        )
+        _apply_plan_status_transition(connection, plan_id, "REJECTED")
 
         connection.execute(
             """
@@ -2054,7 +2033,6 @@ def run_simulation(scenario: SimulationRequest):
             ).fetchall()
         train_rows = connection.execute("SELECT * FROM train_schedules ORDER BY entry_time_min ASC").fetchall()
         section_rows = connection.execute("SELECT * FROM sections").fetchall()
-        station_map = get_station_map(connection)
         section_map = get_section_map(connection)
 
         trains = [TrainSchedule(**dict(r)) for r in train_rows]
@@ -2156,8 +2134,6 @@ def run_simulation(scenario: SimulationRequest):
                 "status": f"Shifted {shift:+d}m" if shift != 0 else "Maintained Schedule",
                 "is_shifted": shift != 0,
             })
-
-        # Simulations remain transient in memory and are not persisted to database
 
         delayed_trains_count = len([d for d in cascade_delays if d["total_delay_min"] > 0])
         total_delay_minutes = sum(d["total_delay_min"] for d in cascade_delays)
