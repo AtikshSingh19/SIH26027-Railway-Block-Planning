@@ -91,10 +91,28 @@ export default function MaintenanceRecords() {
   const [newRequestModalOpen, setNewRequestModalOpen] = useState(false)
   const [myRequestsOpen, setMyRequestsOpen] = useState(false)
 
-const myRequests = useMemo(() => {
-  const requests = workflow.getMyRequests(user?.name)
-  return Array.isArray(requests) ? requests : []
-}, [workflow, user?.name])
+  const myRequests = useMemo(() => {
+    const localRequests = workflow.getMyRequests(user?.name) || []
+    if (!blockRequests || !Array.isArray(blockRequests)) return localRequests
+
+    const blockReqMap = new Map(blockRequests.map((r) => [r.id, r]))
+
+    return localRequests.map((entry) => {
+      const backendReq = blockReqMap.get(entry.id)
+      if (!backendReq) return entry
+      let effectiveStatus = backendReq.status
+      if (backendReq.planning_status === 'PLANNED' || backendReq.status === 'PLANNED') {
+        effectiveStatus = 'SCHEDULED'
+      } else if (backendReq.status === 'APPROVED') {
+        effectiveStatus = 'APPROVED'
+      }
+      return {
+        ...entry,
+        status: effectiveStatus || entry.status,
+        request: backendReq.request || entry.request,
+      }
+    })
+  }, [workflow, user?.name, blockRequests])
 
   async function handleSubmitNewRequest(request, meta) {
     await api.createMaintenanceRequest(request, { ...meta, requestedBy: user?.name || 'Employee' })

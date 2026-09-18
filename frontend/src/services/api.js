@@ -324,8 +324,9 @@ async function reoptimizePlan(planId) {
   return data
 }
 
-async function approvePlan(result) {
-  const { data } = await httpClient.post('/plans/approve', result)
+async function approvePlan(resultPayload) {
+  const payload = resultPayload?.result ? resultPayload : { result: resultPayload }
+  const { data } = await httpClient.post('/plans/approve', payload)
   return data
 }
 async function rejectPlan(planId, reason) {
