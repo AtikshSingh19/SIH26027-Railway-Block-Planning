@@ -25,6 +25,15 @@ import {
 // `department` maps a role to the `department` field already present on
 // maintenanceTasks / blockRequests / alerts. `null` means "cross-department,
 // sees everything" — used by Control Office, Block/Operations, and Admin.
+export const DEMO_ACCOUNTS = [
+  { loginId: '001', password: '001', roleId: 'employee', label: 'Employee / Maintenance Requester' },
+  { loginId: '002', password: '002', roleId: 'control_office', label: 'Control Office / Divisional Operations Planner' },
+  { loginId: '003', password: '003', roleId: 'engineering', label: 'Engineering Planner' },
+  { loginId: '004', password: '004', roleId: 'snt', label: 'S&T Planner' },
+  { loginId: '005', password: '005', roleId: 'traction', label: 'Traction / TD Planner' },
+  { loginId: '006', password: '006', roleId: 'admin', label: 'Admin / Supervisor' },
+]
+
 export const ROLES = [
   { id: 'employee', label: 'Employee / Maintenance Requester', shortLabel: 'Employee', department: 'Engineering', category: 'employee' },
   {
@@ -50,7 +59,7 @@ export const ROLES = [
   },
   {
     id: 'traction',
-    label: 'Traction/TD Planner',
+    label: 'Traction / TD Planner',
     shortLabel: 'Traction/TD',
     department: 'Traction Distribution',
     category: 'planner',
@@ -64,7 +73,7 @@ export const ROLES = [
   },
   {
     id: 'admin',
-    label: 'Admin/Supervisor',
+    label: 'Admin / Supervisor',
     shortLabel: 'Admin',
     department: null,
     category: 'admin',

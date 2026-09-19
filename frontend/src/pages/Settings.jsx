@@ -113,7 +113,7 @@ export default function Settings() {
           </div>
         </div>
         <p className="text-xs text-ink-faint mt-3">
-          To switch roles for this demo, use the role selector in the top-right of the header.
+          To switch roles, click "Change Role" in the header to return to the login page and re-authenticate.
         </p>
       </section>
 

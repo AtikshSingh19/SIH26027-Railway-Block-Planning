@@ -60,13 +60,17 @@ export function RoleProvider({ children }) {
       setRoleIdState(nextRoleId)
       setUser((prev) => (prev ? { ...prev, roleId: nextRoleId } : prev))
     },
-    login: ({ name, roleId: nextRoleId }) => {
+    login: ({ loginId, roleId: nextRoleId }) => {
       setRoleIdState(nextRoleId)
-      setUser({ name: name.trim(), roleId: nextRoleId, loggedInAt: new Date().toISOString() })
+      setUser({ loginId: String(loginId).trim(), roleId: nextRoleId, loggedInAt: new Date().toISOString() })
     },
     logout: () => {
       setUser(null)
-      try { window.sessionStorage.removeItem(USER_KEY) } catch {}
+      setRoleIdState(DEFAULT_ROLE_ID)
+      try {
+        window.sessionStorage.removeItem(USER_KEY)
+        window.sessionStorage.removeItem(ROLE_KEY)
+      } catch {}
     },
   }), [roleId, role, user])
   return <RoleContext.Provider value={value}>{children}</RoleContext.Provider>
